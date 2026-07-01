@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "Bash(npm --version)",
+      "Bash(npm view *)",
+      "Bash(pip show *)",
+      "Bash(pip3 show *)",
+      "Bash(pip index *)",
+      "Bash(npm install *)",
+      "Bash(git clone *)",
+      "Bash(npm list *)",
+      "Bash(npm root *)",
+      "Bash(pip install *)",
+      "Bash(PYTHONPATH=\"C:/Users/sunshenao/Desktop/learn/vibe/cn-financial-mcp/src\" python *)"
+    ]
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "cn-financial": {
+      "type": "stdio",
+      "command": "python",
+      "args": ["-m", "cn_financial_mcp"],
+      "env": {
+        "PYTHONPATH": "C:\\Users\\sunshenao\\Desktop\\learn\\vibe\\cn-financial-mcp\\src"
+      }
+    }
+  }
+}

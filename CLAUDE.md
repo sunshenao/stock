@@ -1,0 +1,159 @@
+# A 股短线操作手册
+
+每天按四个时段执行。每个时段开始前先读取 `codex/lessons_learned.md`。
+
+---
+
+## 早盘（开盘前 9:00-9:25）
+
+### 目标：结合最新情况给出今日操作建议
+
+- [ ] 读取 `codex/lessons_learned.md`
+- [ ] 读取 `codex/stock/current_positions.md`
+- [ ] 用 `news-search` 搜隔夜重大新闻（外盘、政策、行业）
+- [ ] 用 `hithink-market-query` 查当前持仓的实时价格、主力资金
+- [ ] 运行 `python scripts/etf_analyzer.py --date <最新交易日> --hithink` 获取最新方向排名
+- [ ] 输出：
+  - 当前持仓状态（每只标的 / 盈亏 / 是否触止损）
+  - 今日 ETF 方向建议（TOP 3 方向）
+  - 今日操作计划（持有 / 加仓 / 减仓 / 换仓）
+  - 关键风险提示（隔夜利空、催化到期、接近止损）
+- [ ] 对拟加仓/换仓的标的跑 `stock_checkup.py` 做体检
+
+---
+
+## 午盘（11:30-13:00）
+
+### 目标：判断持仓是否需要变动
+
+- [ ] 用 `hithink-market-query` 查当前持仓上午表现（涨跌幅、主力资金）
+- [ ] 判断：
+  - 主力反水（净流出 > 1 亿）→ 立即减仓
+  - 跌幅 > 2% 且弱于同方向 ETF → 降为观察仓
+  - 涨幅 > 3% 且主力净流入 → 持有不动
+  - 横盘且缩量 → 保持观察，不操作
+- [ ] 若发现新主线方向（盘中 ETF 涨幅榜出现新面孔且量比 > 2），记录为候补，不急于追
+- [ ] 输出：午盘持仓状态 + 是否需要调整
+
+---
+
+## 尾盘（14:30-15:00）
+
+### 目标：最终操作决策
+
+- [ ] 用 `hithink-market-query` 查持仓最新价、主力资金
+- [ ] 决策矩阵：
+  - 持仓浮盈 > 15% 且 5 日动量减速 → 止盈锁利
+  - 持仓浮亏且主力流出 → 减半仓
+  - 持仓横盘但主力持续流入 → 持有过夜
+  - 新方向全天强势 + 主力确认 → 可小幅建仓（≤15%）
+- [ ] 输出：每只标的的尾盘操作（持有/减仓/加仓/清仓）+ 理由
+
+---
+
+## 盘后（收盘后）
+
+### 目标：总结 + 选股 + 纠错
+
+### 4.1 当日总结
+
+- [ ] 对比今日实际涨跌 vs 早盘判断 → 记录偏差
+- [ ] 列出今日最大失误（一条）和原因
+- [ ] 若发现新教训 → **立即写入 `codex/lessons_learned.md`**（格式：L + 递增编号 + 场景/教训/规则三段式）
+
+### 4.2 完整选股（为明日做准备）
+
+严格按以下步骤执行：
+
+**Step 0: 准备**
+- [ ] 读取 `codex/lessons_learned.md`，对照检查
+- [ ] 读取 `codex/stock/current_positions.md`
+- [ ] 读取 `codex/stock/candidate_pool.md`
+
+**Step 1: ETF 扫描**
+```
+python scripts/etf_analyzer.py --date YYYY-MM-DD --hithink
+```
+- [ ] 确认报告已生成，有效行情 > 0
+- [ ] 确认 `数据质量` 中旧行情已剔除，主排名不得混入早于目标日且未被同花顺实时补全的数据
+
+**Step 2: 市场环境 + 方向筛选**
+- [ ] 市场状态 → 仓位上限
+- [ ] 从排名表筛选扩散/加速/确认/萌芽期方向
+- [ ] 排除 ⚠过热、衰弱、衰竭
+- [ ] 熔断检查：触及条件 → 现金可放宽
+
+**Step 3: 催化验证**
+- [ ] news-search + announcement-search 验证 TOP 方向
+- [ ] 财报季（1/4/7/10 月）→ 个股打 7 折
+- [ ] 已发生催化超 1 天 → 重验主力资金
+
+**Step 4: 标的选择**
+- [ ] 对 ETF 方向找匹配个股（从 candidate_pool）
+- [ ] 跑 `stock_checkup.py` + `expert_debate.py`（强制步骤）
+- [ ] 决策：个股 B+ + 共识≥40 + 盈亏比≥1.5 → 选个股，否则 ETF
+- [ ] 若第 3 名比第 2 名低 8 分 → 允许只选 2 只
+- [ ] 回测查表验证胜率 ≥ 45%
+
+**Step 5: 仓位计算**
+```
+python scripts/kelly_sizer.py
+```
+- [ ] 时间止损检查：持仓 > 8 天未盈利 → 减半
+- [ ] 跌停检查：个股前日跌幅 > -9% → 竞价卖出
+
+**Step 6: 输出 selection.md**
+- [ ] ETF vs 个股对比表
+- [ ] 最终组合表 + 建仓纪律 + 偏差核查
+- [ ] 运行 `python scripts/selection_guard.py codex/stock/YYYY-MM-DD/selection.md`，未通过则不得作为正式执行方案
+
+**Step 7: 同步持仓台账**
+- [ ] 更新 `current_positions.md`
+- [ ] 新个股写入 `candidate_pool.md`
+
+---
+
+## 执行检查清单（每次盘后选股逐条确认）
+
+- [ ] 独立性：不以用户提到的方向为预设结论
+- [ ] 数据新鲜度：ETF 主排名不允许混入旧行情；旧行情必须有同花顺实时补全标记
+- [ ] 过热排除：⚠过热/衰弱/衰竭/休眠 → 直接排除
+- [ ] 主线簇：通信/芯片/机器人/AI 同时走强 → AI 算力硬件簇，优先 CPO，半导体
+- [ ] 熔断：沪深300破20日线+北向连续流出等 → 现金可放宽；退出需两条恢复+非冰点
+- [ ] 盘中复核：开盘30-60分钟必做，催化兑现或主力反水 → 立即切换
+- [ ] 催化时效：已发生催化 > 1天 → 重验主力资金
+- [ ] 财报季：1/4/7/10月中下旬 → 个股打7折
+- [ ] 个股对比：每只 ETF 必须对比对应个股（强制步骤）
+- [ ] 1-2 只规则：第3名评分比第2名低8分以上 → 只选2只
+- [ ] 回测查表：TOP方向同阶段周频胜率 ≥ 45%
+- [ ] 时间止损：持仓 > 8天未盈利 → 减半
+- [ ] 跌停卖出：个股前日 > -9% → 竞价卖出
+- [ ] 浮盈锁利：浮盈 > 15% 且 5 日动量减速 → 止损收紧至浮盈 50%
+- [ ] QDII 检查：溢价未知 → 不重仓
+- [ ] 现金硬约束：非冰点现金不得超过40%，selection_guard 未通过不可执行
+
+---
+
+## 工具速查
+
+| 工具 | 命令 | 时段 |
+|---|---|---|
+| ETF 扫描 | `python scripts/etf_analyzer.py --date YYYY-MM-DD --hithink` | 盘后 |
+| 方案校验 | `python scripts/selection_guard.py codex/stock/YYYY-MM-DD/selection.md` | 盘后 |
+| 个股体检 | `python scripts/stock_checkup.py <代码> --industry <行业>` | 早盘/盘后 |
+| 专家辩论 | `python scripts/expert_debate.py <代码>` | 盘后 |
+| 凯利仓位 | `python scripts/kelly_sizer.py` | 盘后 |
+| 回测 | `python scripts/backtest.py --start YYYY-MM-DD` | 盘后 |
+| 实时行情 | hithink-market-query | 全时段 |
+| 新闻搜索 | news-search | 早盘 |
+| 公告查询 | announcement-search | 盘后 |
+| 研报搜索 | report-search | 盘后 |
+
+## 必需文件清单
+
+| 文件 | 作用 | 读取时机 |
+|---|---|---|
+| `codex/lessons_learned.md` | 经验教训库 | **每个时段开头** |
+| `codex/stock/current_positions.md` | 持仓台账 | 每次操作前 |
+| `codex/stock/candidate_pool.md` | 候选池 | 盘后选股 |
+| `scripts/etf.txt` | ETF 池 | 扫描时 |
