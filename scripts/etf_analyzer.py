@@ -55,6 +55,15 @@ STAGE_PRIORITY = {
 
 NEW_MONEY_STAGES = {"扩散期", "加速期", "确认期", "萌芽期"}
 EXCLUDED_STAGES = {"衰弱期", "弱势期", "休眠期", "衰竭期", "加速见顶⚠", "加速期⚠"}
+PORTFOLIO_MIN_AMOUNT_YI = 1.0
+PORTFOLIO_MAX_SAME_INDUSTRY = 2
+PORTFOLIO_MAX_BROAD = 1
+PORTFOLIO_THEME_TOLERANCE = 6.0
+GENERIC_DIRECTION_WORDS = ("科技", "信息技术", "科创50", "科创100", "科创综指", "创业板", "中证")
+SPECIFIC_THEME_WORDS = (
+    "创新药", "生物医药", "半导体设备", "科创新材料", "机器人", "通信",
+    "消费电子", "证券保险", "卫星", "工业母机", "科创200", "战略新兴",
+)
 
 # 行业差异化阈值（统一维护于 risk_rules.py）
 from risk_rules import INDUSTRY_THRESHOLDS
@@ -157,6 +166,35 @@ def get_market_environment() -> dict:
         "position_cap": cap,
         "note": _market_note(market_state, up_ratio),
     }
+
+
+def get_replay_market_environment(target_date: str) -> dict:
+    """历史复盘禁止引用当前实时市场宽度，避免未来数据污染。"""
+    cap = get_position_cap("未知").text
+    return {
+        "market_state": "历史复盘",
+        "up_count": "不使用实时宽度",
+        "down_count": "不使用实时宽度",
+        "up_ratio": "不使用实时宽度",
+        "position_cap": cap,
+        "note": (
+            f"{target_date} 为历史目标日，ETF 排名只使用目标日及以前行情；"
+            "实时市场宽度不参与复盘判断。非冰点默认按最低 60% 进攻仓约束。"
+        ),
+    }
+
+
+def get_latest_realtime_trade_ts(now: pd.Timestamp | None = None) -> pd.Timestamp:
+    """同花顺实时快照对应的最新交易日，盘后跨午夜仍归属前一交易日。"""
+    ts = pd.Timestamp.now() if now is None else pd.Timestamp(now)
+    day = ts.normalize()
+
+    if ts.weekday() >= 5:
+        day = day - pd.offsets.BDay(1)
+    elif ts.hour < 9 or (ts.hour == 9 and ts.minute < 30):
+        day = day - pd.offsets.BDay(1)
+
+    return pd.Timestamp(day).normalize()
 
 
 def _market_note(state: str, up_ratio: float) -> str:
@@ -853,6 +891,131 @@ def _pick_diversified(candidates: list[dict], target_count: int = 3) -> list[dic
     return picks
 
 
+def _specificity_score(r: dict) -> float:
+    direction = str(r.get("direction", ""))
+    name = str(r.get("etf_name", ""))
+    text = direction + name
+    if r.get("industry") == "宽基":
+        return -1.0
+    if any(word in text for word in SPECIFIC_THEME_WORDS):
+        return 2.0
+    if any(word in text for word in GENERIC_DIRECTION_WORDS):
+        return 0.0
+    return 1.0
+
+
+def _portfolio_rank_key(r: dict) -> tuple:
+    m = r.get("metrics", {})
+    score = float(r.get("score", {}).get("total") or 0)
+    adjusted = score + _specificity_score(r)
+    return (
+        adjusted,
+        STAGE_PRIORITY.get(r.get("stage", ("", "", ""))[0], -99),
+        float(m.get("ret_5d") or 0),
+        float(m.get("amount_yi") or 0),
+    )
+
+
+def _portfolio_exclusion_reason(r: dict) -> str | None:
+    m = r.get("metrics", {})
+    stage = r.get("stage", ("", "", ""))[0]
+    if "error" in m:
+        return str(m.get("error"))
+    if stage not in NEW_MONEY_STAGES:
+        return f"{stage}不适合作为新组合主仓"
+    if r.get("category") in {"货币", "债券"}:
+        return "现金/债券工具不进入进攻组合"
+    if r.get("is_qdii"):
+        return "QDII/跨境ETF折溢价未知，不作为默认主仓"
+    if float(m.get("amount_yi") or 0) < PORTFOLIO_MIN_AMOUNT_YI:
+        return f"成交额<{PORTFOLIO_MIN_AMOUNT_YI:.0f}亿，不作为主仓"
+    if m.get("overheat") and float(m.get("pct_chg") or 0) >= 7:
+        return "20日过热且单日高潮，不新开主仓"
+    return None
+
+
+def _better_theme_candidate(current: dict, challenger: dict) -> dict:
+    """分数接近时，用更具体的主题 ETF 替代泛科技/泛宽基。"""
+    current_score = float(current.get("score", {}).get("total") or 0)
+    challenger_score = float(challenger.get("score", {}).get("total") or 0)
+    if current_score - challenger_score > PORTFOLIO_THEME_TOLERANCE:
+        return current
+    if _specificity_score(challenger) > _specificity_score(current):
+        return challenger
+    return current
+
+
+def pick_formal_portfolio(candidates: list[dict], target_count: int = 3) -> tuple[list[dict], list[tuple[dict, str]]]:
+    """
+    正式组合选择器。
+    它比“强度排名”更严格：流动性、同主线集中度、宽基数量和过热新开都在这里统一处理。
+    """
+    excluded = []
+    eligible = []
+    for r in candidates:
+        reason = _portfolio_exclusion_reason(r)
+        if reason:
+            excluded.append((r, reason))
+        else:
+            eligible.append(r)
+
+    ordered = sorted(eligible, key=_portfolio_rank_key, reverse=True)
+    selected = []
+    industry_count: dict[str, int] = {}
+    broad_count = 0
+
+    for r in ordered:
+        ind = r.get("industry", "其他")
+        selected_codes = {x.get("etf_code") for x in selected}
+
+        if ind == "宽基" and len(selected) >= 2:
+            selected_non_broad_industries = [
+                x.get("industry") for x in selected
+                if x.get("industry") not in {"宽基", "债券", "货币"}
+            ]
+            # 前两只已经压在同一行业时，第三只优先拿具体主题，不用宽基凑数。
+            if len(set(selected_non_broad_industries)) == 1:
+                broad_score = _portfolio_rank_key(r)[0]
+                alternatives = [
+                    x for x in ordered
+                    if x.get("etf_code") not in selected_codes
+                    and x.get("industry") not in {"宽基", "债券", "货币"}
+                    and industry_count.get(x.get("industry", "其他"), 0) < PORTFOLIO_MAX_SAME_INDUSTRY
+                    and broad_score - _portfolio_rank_key(x)[0] <= PORTFOLIO_THEME_TOLERANCE
+                ]
+                if alternatives:
+                    r = alternatives[0]
+                    ind = r.get("industry", "其他")
+        if ind == "宽基":
+            if broad_count >= PORTFOLIO_MAX_BROAD:
+                continue
+        elif industry_count.get(ind, 0) >= PORTFOLIO_MAX_SAME_INDUSTRY:
+            continue
+
+        # 若同一行业已有泛主题，且新候选分数接近但更具体，替换泛主题。
+        replaced = False
+        for idx, current in enumerate(selected):
+            if current.get("industry") != ind or ind == "宽基":
+                continue
+            better = _better_theme_candidate(current, r)
+            if better is r:
+                selected[idx] = r
+                replaced = True
+                break
+        if replaced:
+            continue
+
+        if len(selected) >= target_count:
+            continue
+
+        selected.append(r)
+        if ind == "宽基":
+            broad_count += 1
+        industry_count[ind] = industry_count.get(ind, 0) + 1
+
+    return selected, excluded
+
+
 def generate_report(results: list, market_env: dict, bench_pct: float, target_date: str, hithink_used: bool = False) -> str:
     """三层分析报告"""
     source_tag = " | 同花顺资金增强已启用" if hithink_used else ""
@@ -993,9 +1156,10 @@ def generate_report(results: list, market_env: dict, bench_pct: float, target_da
     )
     raw_picks = candidate_picks[:5]
     picks = _pick_diversified(candidate_picks, target_count=3)
+    formal_picks, formal_excluded = pick_formal_portfolio(candidate_picks, target_count=3)
 
     if raw_picks:
-        lines.append("原始强度前三：")
+        lines.append("原始强度前三（诊断参考，非执行组合）：")
         lines.append("")
         lines.append("| 排名 | 方向 | 类型 | 行业 | 阶段 | 评分 | ETF/LOF |")
         lines.append("|---:|---|---|---|---|---:|---|")
@@ -1007,7 +1171,31 @@ def generate_report(results: list, market_env: dict, bench_pct: float, target_da
                 f"| {i} | {r['direction']} | {product_note} | {r['industry']} | {r['stage'][0]} | {r['score']['total']:.1f} | {r['etf_name']} `{r['etf_code']}` |"
             )
         lines.append("")
-        lines.append("去相关组合候选：")
+        lines.append("正式组合候选（唯一执行口径，执行硬门禁后）：")
+        lines.append("")
+        lines.append("| 优先级 | 方向 | 类型 | 行业 | 阶段 | 评分 | 建议仓位 | ETF或候选标的 |")
+        lines.append("|---:|---|---|---|---|---:|---|---|")
+        for i, r in enumerate(formal_picks[:3], 1):
+            product_note = r.get("product_type", "ETF")
+            if r.get("is_qdii"):
+                product_note = f"{product_note}/QDII"
+            lines.append(
+                f"| {i} | {r['direction']} | {product_note} | {r['industry']} | {r['stage'][0]} | {r['score']['total']:.1f} | 20% "
+                f"| {r['etf_name']} `{r['etf_code']}` |"
+            )
+        if formal_excluded:
+            shown = 0
+            lines.append("")
+            lines.append("主要剔除原因：")
+            for r, reason in formal_excluded:
+                if shown >= 6:
+                    break
+                if float(r.get("score", {}).get("total") or 0) <= 0:
+                    continue
+                lines.append(f"- {r['direction']}：{reason}")
+                shown += 1
+        lines.append("")
+        lines.append("去相关组合参考（诊断参考，非执行组合）：")
         lines.append("")
         lines.append("| 优先级 | 方向 | 类型 | 行业 | 阶段 | 评分 | 建议仓位 | ETF或候选标的 |")
         lines.append("|---:|---|---|---|---|---:|---|---|")
@@ -1020,7 +1208,7 @@ def generate_report(results: list, market_env: dict, bench_pct: float, target_da
                 f"| {r['etf_name']} `{r['etf_code']}` |"
             )
         lines.append("")
-        lines.append("> 原始强度用于确认主线，去相关候选用于避免三个标的押同一政策/情绪周期；正式 selection 仍需做催化验证、个股买点、ETF/LOF 折溢价风险和盈亏比检查。")
+        lines.append("> 原始强度和去相关组合只用于解释资金主线；每日正式 selection 只能从“正式组合候选”继续做催化、买点、ETF/LOF 折溢价风险和盈亏比检查。")
     else:
         lines.append("> 当前无扩散期或确认期方向，建议以现金为主或仅保留试探仓")
 
@@ -1039,10 +1227,23 @@ def main():
     args = parser.parse_args()
 
     target_date = args.date or datetime.now().strftime("%Y-%m-%d")
+    target_ts = pd.to_datetime(target_date).normalize()
+    latest_realtime_ts = get_latest_realtime_trade_ts()
+    use_hithink_realtime = bool(args.hithink and target_ts == latest_realtime_ts)
+    if args.hithink and target_ts != latest_realtime_ts:
+        print(
+            f"  同花顺实时增强已禁用: target_date={target_date} 不是最新实时交易日"
+            f" {latest_realtime_ts.strftime('%Y-%m-%d')}，避免实时数据污染历史复盘",
+            file=sys.stderr,
+        )
 
     # Layer 1: 市场环境
     print("Layer 1: 获取市场宽度...", file=sys.stderr)
-    market_env = get_market_environment()
+    if target_ts == latest_realtime_ts:
+        market_env = get_market_environment()
+    else:
+        market_env = get_replay_market_environment(target_date)
+        print("  历史复盘模式: 不使用实时市场宽度", file=sys.stderr)
     print(f"  状态={market_env['market_state']}, 涨跌比={market_env['up_ratio']}, 仓位上限={market_env['position_cap']}", file=sys.stderr)
 
     etf_pool = load_etf_txt()
@@ -1130,12 +1331,12 @@ def main():
     valid_count = sum(1 for r in results if "error" not in r["metrics"])
     hithink_used = False
     hot_keywords = set()
-    if args.hithink or valid_count == 0:
+    if use_hithink_realtime or (valid_count == 0 and target_ts == latest_realtime_ts):
         hot_keywords = fetch_market_sentiment()
         if hot_keywords:
             print(f"  市场热度: 热议方向 -> {', '.join(sorted(hot_keywords)[:6])}", file=sys.stderr)
 
-    if args.hithink or valid_count == 0:
+    if use_hithink_realtime or (valid_count == 0 and target_ts == latest_realtime_ts):
         enrichment = enrich_with_hithink(sorted(results, key=_rank_key, reverse=True), top_n=50)
         if enrichment["available"]:
             hithink_used = True
@@ -1168,6 +1369,9 @@ def main():
             print(f"错误: {target_date} 没有任何有效行情且同花顺数据也不可用", file=sys.stderr)
             print("提示: 请检查 AKShare 网络连接，或手动运行 hithink CLI 确认 API 配置", file=sys.stderr)
             sys.exit(2)
+    elif valid_count == 0:
+        print(f"错误: {target_date} 没有任何历史有效行情；历史日期禁止用同花顺实时数据回填", file=sys.stderr)
+        sys.exit(2)
 
     stale_excluded = mark_unpatched_stale_results(results, target_date)
     if stale_excluded:
