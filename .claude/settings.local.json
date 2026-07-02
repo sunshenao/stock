@@ -81,7 +81,8 @@
       "Bash(command -v uv pipx conda pyenv)",
       "Bash(python3 -m pip install --user pandas akshare tabulate)",
       "Bash(python3 *)",
-      "Bash(echo \"rc=$?\")"
+      "Bash(echo \"rc=$?\")",
+      "mcp__cn-financial__search_news"
     ]
   },
   "enableAllProjectMcpServers": true,
