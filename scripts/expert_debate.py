@@ -10,9 +10,16 @@ from datetime import datetime
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-SKILL_ROOT = Path(os.path.expanduser("~")) / "AppData/Roaming/npm/node_modules/stock-analyzer-skill"
-sys.path.insert(0, str(SKILL_ROOT / "scripts"))
-sys.path.insert(0, str(SKILL_ROOT))
+sys.path.insert(0, str(SCRIPT_DIR))
+
+from skill_paths import find_skill_root, find_skill_scripts
+
+SKILL_ROOT = find_skill_root("stock-analyzer-skill")
+SKILL_SCRIPTS = find_skill_scripts("stock-analyzer-skill")
+if SKILL_SCRIPTS:
+    sys.path.insert(0, str(SKILL_SCRIPTS))
+if SKILL_ROOT:
+    sys.path.insert(0, str(SKILL_ROOT))
 
 from experts.scoring import (sector_specialist, momentum_trader, risk_manager,
                               value_anchor, institution, emotion_tech, topic_leader)

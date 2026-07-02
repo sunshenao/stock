@@ -27,14 +27,12 @@ PROJECT_ROOT = SCRIPT_DIR.parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from risk_rules import get_position_cap, premium_discount_factor
+from skill_paths import find_hithink_cli, find_skill_scripts
 
-# Stock-analyzer-skill 路径
-SKILL_SCRIPTS = os.path.join(
-    os.path.expanduser("~"),
-    "AppData", "Roaming", "npm", "node_modules", "stock-analyzer-skill", "scripts"
-)
-if os.path.isdir(SKILL_SCRIPTS):
-    sys.path.insert(0, SKILL_SCRIPTS)
+# Stock-analyzer-skill 路径（兼容 .claude/.codex/npm 全局安装）
+SKILL_SCRIPTS = find_skill_scripts("stock-analyzer-skill")
+if SKILL_SCRIPTS:
+    sys.path.insert(0, str(SKILL_SCRIPTS))
 ETF_TXT_PATH = SCRIPT_DIR / "etf.txt"
 BENCHMARK_CODE = "510300"  # 沪深300ETF 基准代码（需在 etf.txt 中存在）
 
@@ -224,8 +222,7 @@ HITHINK_CLI = None  # 延迟初始化
 def _get_hithink_cli():
     global HITHINK_CLI
     if HITHINK_CLI is None:
-        skill_dir = os.path.join(os.path.expanduser("~"), ".claude", "skills", "hithink-market-query", "scripts")
-        HITHINK_CLI = os.path.join(skill_dir, "cli.py") if os.path.isdir(skill_dir) else None
+        HITHINK_CLI = find_hithink_cli()
     return HITHINK_CLI
 
 
@@ -1362,6 +1359,7 @@ def main():
                     # Re-score with money flow
                     r["score"] = calc_auto_score(
                         r["metrics"], r["stage"][0], bench_pct,
+                        consecutive_strong=r.get("strong_days", 0),
                         is_qdii=r.get("is_qdii", False),
                         premium_pct=r.get("premium_pct"),
                     )

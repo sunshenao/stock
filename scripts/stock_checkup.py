@@ -13,17 +13,18 @@ import sys
 import os
 import subprocess
 import json
+from pathlib import Path
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-SKILL_SCRIPTS = os.path.join(
-    os.path.expanduser("~"),
-    "AppData", "Roaming", "npm", "node_modules", "stock-analyzer-skill", "scripts"
-)
-sys.path.insert(0, SKILL_SCRIPTS)
+SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIR))
 
-IWENCAI_CLI = os.path.join(
-    os.path.expanduser("~"), ".claude", "skills", "hithink-market-query", "scripts", "cli.py"
-)
+from skill_paths import find_hithink_cli, find_skill_scripts
+
+SKILL_SCRIPTS = find_skill_scripts("stock-analyzer-skill")
+if SKILL_SCRIPTS:
+    sys.path.insert(0, str(SKILL_SCRIPTS))
+
+IWENCAI_CLI = find_hithink_cli()
 
 # 行业差异化阈值（统一维护于 risk_rules.py）
 from risk_rules import INDUSTRY_THRESHOLDS as THRESHOLDS
@@ -77,6 +78,8 @@ def get_finance_info(code: str) -> dict:
 
 def get_flow_info(code: str) -> dict:
     """获取主力资金流向（通过 hithink CLI）"""
+    if not IWENCAI_CLI:
+        return {"main_flow": None, "fund_flow": "N/A", "data_ok": False, "error": "未找到 hithink-market-query CLI"}
     env = os.environ.copy()
     settings_path = os.path.join(os.path.expanduser("~"), ".claude", "settings.json")
     try:
@@ -91,7 +94,7 @@ def get_flow_info(code: str) -> dict:
     last_error = ""
     try:
         result = subprocess.run(
-            ["python", IWENCAI_CLI, "--query", f"{code} 主力资金流向 北向资金", "--limit", "1", "--timeout", "20"],
+            [sys.executable, IWENCAI_CLI, "--query", f"{code} 主力资金流向 北向资金", "--limit", "1", "--timeout", "20"],
             capture_output=True, text=True, env=env, timeout=25,
         )
         if result.returncode == 0:
@@ -119,6 +122,15 @@ def get_flow_info(code: str) -> dict:
 
 def get_technical_info(code: str) -> dict:
     """获取技术面数据：均线位置、MACD、KDJ"""
+    if not IWENCAI_CLI:
+        return {
+            "macd": None,
+            "kdj": None,
+            "ma5_dist": None,
+            "ma20_dist": None,
+            "data_ok": False,
+            "error": "未找到 hithink-market-query CLI",
+        }
     env = os.environ.copy()
     settings_path = os.path.join(os.path.expanduser("~"), ".claude", "settings.json")
     try:
@@ -133,7 +145,7 @@ def get_technical_info(code: str) -> dict:
     last_error = ""
     try:
         result = subprocess.run(
-            ["python", IWENCAI_CLI, "--query",
+            [sys.executable, IWENCAI_CLI, "--query",
              f"{code} MACD KDJ 均线 距5日线 距20日线", "--limit", "1", "--timeout", "20"],
             capture_output=True, text=True, env=env, timeout=25,
         )

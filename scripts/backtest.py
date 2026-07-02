@@ -48,9 +48,18 @@ EXPOSURE_BY_MARKET = {
     "主升": 1.00,
     "震荡": 0.80,
     "退潮": 0.60,
+    "退潮末期": 0.40,
     "冰点": 0.30,
     "未知": 0.60,
 }
+# 追高硬门禁：符合任一条件时该腿仅按试探仓 10% 建仓
+# 只在防守市场（退潮/退潮末期/冰点）触发；主升/震荡下真趋势不做机械稀释。
+CHASE_5D_RETURN_LIMIT = 25.0
+CHASE_SINGLE_DAY_LIMIT = 4.0
+PROBE_WEIGHT = 0.10
+DEFENSIVE_STATES = {"退潮", "退潮末期", "冰点"}
+# 组合最低入选分数：分数低于此的候选不进入主仓；不再机械补足到 TOP N
+MIN_ENTRY_SCORE = 45.0
 # 月频/周频止损规则：max(固定百分比, N × ATR)
 PERIOD_STOP_RULES = {
     "monthly": {
@@ -79,7 +88,15 @@ HOLD_BONUS = {
 
 # 简易市场状态判断（回测无实时 market_breadth，用基准趋势替代）
 def _simple_market_state(bench_df, signal_date):
-    """用沪深300 20日均线判断市场状态——保持简单，不过度拟合。"""
+    """
+    用沪深300 20日均线判断市场状态——保持简单，不过度拟合。
+
+    - close > MA20*1.02 → 主升
+    - close > MA20      → 震荡
+    - close > MA20*0.98 → 退潮 (-2% ~ 0)
+    - close > MA20*0.95 → 退潮末期 (-5% ~ -2%)
+    - else              → 冰点 (<-5%)
+    """
     td = pd.to_datetime(signal_date)
     recent = bench_df[bench_df["date"] <= td].tail(25)
     if len(recent) < 22:
@@ -90,8 +107,10 @@ def _simple_market_state(bench_df, signal_date):
         return "主升", EXPOSURE_BY_MARKET["主升"]
     elif close > ma20:
         return "震荡", EXPOSURE_BY_MARKET["震荡"]
-    elif close > ma20 * 0.95:
+    elif close > ma20 * 0.98:
         return "退潮", EXPOSURE_BY_MARKET["退潮"]
+    elif close > ma20 * 0.95:
+        return "退潮末期", EXPOSURE_BY_MARKET["退潮末期"]
     else:
         return "冰点", EXPOSURE_BY_MARKET["冰点"]
 
@@ -329,11 +348,9 @@ def _should_hold_position(
 
 
 def _new_position_allowed(item: dict, market_state: str) -> bool:
-    """弱市过滤：冰点不新开仓，退潮提高新开仓门槛。"""
+    """弱市过滤：冰点不新开仓，退潮/退潮末期提高新开仓门槛。"""
     if market_state == "冰点":
         return False
-    if market_state != "退潮":
-        return True
 
     metrics = item.get("metrics", {})
     score = float(item.get("score", {}).get("total") or 0)
@@ -341,11 +358,33 @@ def _new_position_allowed(item: dict, market_state: str) -> bool:
     ret5 = float(metrics.get("ret_5d") or 0)
     ret20 = float(metrics.get("ret_20d") or 0)
 
-    if score < 55 or stage not in {"扩散期", "加速期", "确认期"}:
+    if market_state == "退潮末期":
+        # 退潮末期只做主力真流入 + 独立叙事的候选：分数≥60、且短期动量非负
+        if score < 60 or stage not in {"扩散期", "加速期", "确认期"}:
+            return False
+        return ret5 > 0
+
+    if market_state == "退潮":
+        if score < 55 or stage not in {"扩散期", "加速期", "确认期"}:
+            return False
+        if item.get("industry") == "周期" or item.get("category") in COMMODITY_CATEGORIES:
+            return ret5 > 0 and ret20 > 0 and score >= 60
+        return ret5 > 0 or ret20 > 0
+
+    return True
+
+
+def _is_chase_high(item: dict, market_state: str = "") -> bool:
+    """
+    L008 硬门禁：单日 >4% 或 5日累计 >25% 视为追高。
+    只在防守市场（退潮/退潮末期/冰点）里触发；主升/震荡下强趋势不做机械稀释。
+    """
+    if market_state and market_state not in DEFENSIVE_STATES:
         return False
-    if item.get("industry") == "周期" or item.get("category") in COMMODITY_CATEGORIES:
-        return ret5 > 0 and ret20 > 0 and score >= 60
-    return ret5 > 0 or ret20 > 0
+    metrics = item.get("metrics", {})
+    pct = float(metrics.get("pct_chg") or 0)
+    ret5 = float(metrics.get("ret_5d") or 0)
+    return pct > CHASE_SINGLE_DAY_LIMIT or ret5 > CHASE_5D_RETURN_LIMIT
 
 
 def _selection_priority(item: dict, freq: str) -> tuple:
@@ -376,16 +415,18 @@ def _selection_priority(item: dict, freq: str) -> tuple:
 def _select_top_candidates(candidate_pool: list[dict], top_n: int, freq: str) -> list[dict]:
     """
     从旧仓和新候选中统一选 TOP。
-    周度更强调主线弹性：最多保留 1 个宽基，避免科创/创业板宽基挤占产业 ETF 名额。
+    - 分数低于 MIN_ENTRY_SCORE 的候选不进入组合（宁少不凑）。
+    - 周度更强调主线弹性：最多保留 1 个宽基，避免宽基挤占产业 ETF 名额。
     """
     ordered = sorted(candidate_pool, key=lambda r: _selection_priority(r, freq), reverse=True)
+    qualified = [r for r in ordered if float(r.get("score", {}).get("total") or 0) >= MIN_ENTRY_SCORE]
     if freq != "weekly":
-        return ordered[:top_n]
+        return qualified[:top_n]
 
     selected = []
     delayed_broad = []
     broad_count = 0
-    for r in ordered:
+    for r in qualified:
         if len(selected) >= top_n:
             break
         if r.get("industry") == "宽基" and broad_count >= WEEKLY_MAX_BROAD:
@@ -628,8 +669,32 @@ def run_backtest(
             continue
 
         selected = realized_selected
-        avg_ret = sum(returns) / len(returns)
-        portfolio_ret = avg_ret * exposure
+        # 分腿加权：
+        # - 追高腿（单日 >4% 或 5日 >25%，仅退潮/冰点触发）按 PROBE_WEIGHT=10% 试探；
+        # - 其余腿平摊剩余目标仓位；
+        # - 目标仓位 = exposure × min(1, n_qualified / max(1, ceil(top_n/2)))，
+        #   即单腿时至少建半仓，两腿及以上打满目标，避免"仅一强腿被机械稀释"。
+        n_legs = len(selected)
+        min_divisor = max(1, (top_n + 1) // 2)  # top_n=3 → 2
+        chase_legs = [r for r in selected if _is_chase_high(r, market_state)]
+        non_chase = [r for r in selected if not _is_chase_high(r, market_state)]
+        probe_total = PROBE_WEIGHT * len(chase_legs)
+        target_deploy = exposure * min(1.0, len(non_chase) / min_divisor)
+        remaining = max(0.0, target_deploy - probe_total)
+        per_leg = remaining / len(non_chase) if non_chase else 0.0
+
+        weighted_sum = 0.0
+        weights = []
+        for r in selected:
+            if _is_chase_high(r, market_state):
+                w = PROBE_WEIGHT
+            else:
+                w = per_leg
+            weights.append(w)
+            weighted_sum += w * r["period_return"]
+        deployed_exposure = sum(weights)
+        raw_return = sum(r["period_return"] for r in selected) / n_legs if n_legs else 0.0
+        portfolio_ret = weighted_sum
         bench_pair = _close_between(bench_df, entry_date, exit_date)
         bench_ret = 0.0
         if bench_pair:
@@ -641,12 +706,14 @@ def run_backtest(
             "entry_date": _fmt_date(entry_date),
             "exit_date": _fmt_date(exit_date),
             "market_state": market_state,
-            "exposure": round(exposure * 100, 1),
+            "exposure": round(deployed_exposure * 100, 1),
             "return_pct": round(portfolio_ret, 2),
-            "raw_return_pct": round(avg_ret, 2),
+            "raw_return_pct": round(raw_return, 2),
             "benchmark_pct": round(bench_ret, 2),
             "top_names": ", ".join(
-                f"{r['entry_type']}-{r['etf_name']}({r['score']['total']:.1f})"
+                f"{r['entry_type']}-{r['etf_name']}({r['score']['total']:.1f}"
+                + (",试探" if _is_chase_high(r, market_state) else "")
+                + ")"
                 for r in selected
             ),
             "top_stages": ", ".join(r["stage"][0] for r in selected),
@@ -670,9 +737,9 @@ def run_backtest(
         }
         print(
             f"  {label}: signal={_fmt_date(signal_date)}, "
-            f"state={market_state}, exposure={exposure:.0%}, "
+            f"state={market_state}, exposure={deployed_exposure:.0%}, "
             f"top={', '.join((r['entry_type'] + '-' + r['etf_name'][:8]) for r in selected)}, "
-            f"ret={portfolio_ret:+.2f}% raw={avg_ret:+.2f}%, bench={bench_ret:+.2f}%"
+            f"ret={portfolio_ret:+.2f}% raw={raw_return:+.2f}%, bench={bench_ret:+.2f}%"
         )
 
     if not rows:
@@ -739,9 +806,11 @@ def write_report(
         weekly_broad_rule,
         "- 周期收益从周期第一个交易日计算到周期最后一个交易日。",
         "- 周期内用日线 low 模拟止损，触发后按止损价退出。",
-        "- 市场环境过滤会降低暴露比例：主升100%、震荡80%、退潮60%、冰点30%。",
+        "- 市场环境过滤会降低暴露比例：主升100%、震荡80%、退潮60%、退潮末期40%、冰点30%。",
         "- 不使用当月已实现收益排序，避免未来函数。",
         "- 商品/资源/LOF 使用更宽的趋势止损，避免强主升浪中被普通行业 ETF 阈值过早洗出。",
+        f"- 追高硬门禁：单日 >{CHASE_SINGLE_DAY_LIMIT:g}% 或 5日 >{CHASE_5D_RETURN_LIMIT:g}% → 该腿按试探仓 {PROBE_WEIGHT*100:.0f}%。",
+        f"- 最低入选分数：{MIN_ENTRY_SCORE:g}；分数不足宁少不凑，允许仓位低于满仓。",
         "",
         "## 参数",
         "",
