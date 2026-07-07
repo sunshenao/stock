@@ -28,7 +28,7 @@ CONSERVATIVE_POSITION_CAP = 15
 PROBE_POSITION_CAP = 10
 MIN_MAIN_ETF_AMOUNT_YI = 1.0
 CHASE_5D_RETURN_LIMIT = 25.0
-CHASE_SINGLE_DAY_LIMIT = 4.0
+CHASE_SINGLE_DAY_LIMIT = 7.0
 
 
 @dataclass(frozen=True)
@@ -293,6 +293,8 @@ def _extract_amount_yi(context: str) -> float | None:
 
 _SINGLE_DAY_HEADERS = ("今日涨跌", "当日涨跌", "单日涨跌", "涨跌幅", "今日涨幅", "当日涨幅")
 _RET5_HEADERS = ("5日动量", "5日涨幅", "5日收益", "近5日", "5日涨跌")
+_RET20_HEADERS = ("20日动量", "20日涨幅", "20日涨跌")
+_OVERSOLD_REBOUND_THRESHOLD = -10.0
 
 
 def _iter_tables(text: str):
@@ -422,8 +424,8 @@ def _validate_holdings(text: str, market_state: str | None, errors: list[str]) -
             if amount is not None and amount < MIN_MAIN_ETF_AMOUNT_YI:
                 errors.append(f"主仓 ETF {holding.instrument} 成交额 {amount:g}亿 < 1亿，不能作为正式主仓")
 
-        # 追高硬门禁（L008 从教训升级为代码级约束）：
-        # 近 5 日累计涨幅 > 25% 或 单日涨幅 > 4% 时，任何腿仓位必须 ≤ 10%（试探仓）。
+        # 追高硬门禁（规则 5：单日≥7%次日不追，看位置不只看幅度）
+        # 默认：单日>7% → 仓位≤10%。例外：20日动量<-10%（超跌反弹）可放宽至标准仓位。
         chase_ctx = context or holding.row_text
         ret5 = _extract_5d_return(chase_ctx)
         if ret5 is None:
@@ -431,12 +433,16 @@ def _validate_holdings(text: str, market_state: str | None, errors: list[str]) -
         chg1 = _extract_single_day_change(chase_ctx)
         if chg1 is None:
             chg1 = _lookup_metric(text, holding, _SINGLE_DAY_HEADERS)
+        ret20 = _lookup_metric(text, holding, _RET20_HEADERS)
         if holding.position_high > PROBE_POSITION_CAP:
             if ret5 is not None and ret5 > CHASE_5D_RETURN_LIMIT:
                 errors.append(
                     f"{holding.instrument} 5日动量 {ret5:+g}%>{CHASE_5D_RETURN_LIMIT:g}%，追高禁令要求仓位≤{PROBE_POSITION_CAP}%"
                 )
             if chg1 is not None and chg1 > CHASE_SINGLE_DAY_LIMIT:
+                # 规则 5 超跌反弹例外：20日动量 < -10% 可放宽
+                if ret20 is not None and ret20 < _OVERSOLD_REBOUND_THRESHOLD:
+                    continue
                 errors.append(
                     f"{holding.instrument} 单日 {chg1:+g}%>{CHASE_SINGLE_DAY_LIMIT:g}%，追高禁令要求仓位≤{PROBE_POSITION_CAP}%"
                 )
