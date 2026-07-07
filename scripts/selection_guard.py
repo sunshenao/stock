@@ -29,6 +29,10 @@ PROBE_POSITION_CAP = 10
 MIN_MAIN_ETF_AMOUNT_YI = 1.0
 CHASE_5D_RETURN_LIMIT = 25.0
 CHASE_SINGLE_DAY_LIMIT = 7.0
+RETREAT_SINGLE_DAY_NO_CATALYST_LIMIT = 5.0
+RETREAT_RET20_NEW_POSITION_LIMIT = 15.0
+RETREAT_RET20_HOLD_ONLY_LIMIT = 25.0
+RETREAT_RET20_HIGH_RISK_LIMIT = 35.0
 
 
 @dataclass(frozen=True)
@@ -282,6 +286,35 @@ def _has_unknown_qdii_premium(context: str) -> bool:
     return "溢价未知" in context or ("溢价" not in context and "折溢价" not in context)
 
 
+def _has_clear_catalyst(context: str) -> bool:
+    if "无事件催化" in context or "无明确事件催化" in context or "无催化" in context:
+        return False
+    catalyst_words = (
+        "政策", "业绩", "财报", "订单", "产品", "发布", "获批", "回购",
+        "涨价", "供给", "减产", "制裁", "美股", "纳指", "费半", "XBI", "中概",
+        "催化", "指引",
+    )
+    return any(word in context for word in catalyst_words)
+
+
+def _has_major_catalyst(context: str) -> bool:
+    if not _has_clear_catalyst(context):
+        return False
+    major_words = (
+        "重磅", "重大", "超预期", "政策", "业绩", "财报", "订单", "获批",
+        "制裁", "禁令", "指引", "涨价", "减产",
+    )
+    return any(word in context for word in major_words)
+
+
+def _is_existing_or_hold_only(context: str) -> bool:
+    hold_words = ("已持有", "持有", "保留", "减仓", "清仓", "不新开", "观察")
+    new_words = ("新进", "新开", "建仓", "买入", "加仓")
+    if any(word in context for word in new_words):
+        return False
+    return any(word in context for word in hold_words)
+
+
 def _extract_amount_yi(context: str) -> float | None:
     match = re.search(r"成交额\s*(\d+(?:\.\d+)?)\s*亿", context)
     if match:
@@ -442,9 +475,35 @@ def _validate_holdings(text: str, market_state: str | None, errors: list[str]) -
             if chg1 is not None and chg1 > CHASE_SINGLE_DAY_LIMIT:
                 # 规则 5 超跌反弹例外：20日动量 < -10% 可放宽
                 if ret20 is not None and ret20 < _OVERSOLD_REBOUND_THRESHOLD:
-                    continue
+                    pass
+                else:
+                    errors.append(
+                        f"{holding.instrument} 单日 {chg1:+g}%>{CHASE_SINGLE_DAY_LIMIT:g}%，追高禁令要求仓位≤{PROBE_POSITION_CAP}%"
+                    )
+
+        if market_state in {"退潮", "退潮末期"}:
+            has_catalyst = _has_clear_catalyst(chase_ctx)
+            has_major_catalyst = _has_major_catalyst(chase_ctx)
+            hold_only = _is_existing_or_hold_only(chase_ctx)
+            if chg1 is not None and chg1 > RETREAT_SINGLE_DAY_NO_CATALYST_LIMIT and not has_catalyst:
                 errors.append(
-                    f"{holding.instrument} 单日 {chg1:+g}%>{CHASE_SINGLE_DAY_LIMIT:g}%，追高禁令要求仓位≤{PROBE_POSITION_CAP}%"
+                    f"退潮期 {holding.instrument} 单日 {chg1:+g}%>{RETREAT_SINGLE_DAY_NO_CATALYST_LIMIT:g}% 且无明确催化，禁止进入最终组合，只能观察"
+                )
+            if chg1 is not None and chg1 > CHASE_SINGLE_DAY_LIMIT and not has_major_catalyst:
+                errors.append(
+                    f"退潮期 {holding.instrument} 单日 {chg1:+g}%>{CHASE_SINGLE_DAY_LIMIT:g}% 且无重磅新催化，禁止进入最终组合"
+                )
+            if ret20 is not None and ret20 > RETREAT_RET20_HIGH_RISK_LIMIT:
+                errors.append(
+                    f"退潮期 {holding.instrument} 20日动量 {ret20:+g}%>{RETREAT_RET20_HIGH_RISK_LIMIT:g}%，默认高位风险，不得作为执行标的"
+                )
+            elif ret20 is not None and ret20 > RETREAT_RET20_HOLD_ONLY_LIMIT and not hold_only:
+                errors.append(
+                    f"退潮期 {holding.instrument} 20日动量 {ret20:+g}%>{RETREAT_RET20_HOLD_ONLY_LIMIT:g}%，只允许持有/减仓，不允许新开"
+                )
+            elif ret20 is not None and ret20 > RETREAT_RET20_NEW_POSITION_LIMIT and not has_catalyst and not hold_only:
+                errors.append(
+                    f"退潮期 {holding.instrument} 20日动量 {ret20:+g}%>{RETREAT_RET20_NEW_POSITION_LIMIT:g}% 且无新催化，不允许新开仓"
                 )
 
     for direction, exposure in direction_exposure.items():

@@ -5,7 +5,7 @@
 原则：
 1. 半凯利只给“自然仓位”，不是必须打满的目标仓位。
 2. 使用真实止损距离计算单笔风险预算，不再用盈亏比反推止损。
-3. 非冰点市场要求现金 <=40%，但只能用合格标的补足最低仓位。
+3. 只有主升/震荡要求积极部署；退潮期允许高现金等待确认。
 4. 补足最低仓位时不得突破单票/单 ETF 上限，也不得把弱机会硬放大。
 """
 from __future__ import annotations
@@ -177,7 +177,7 @@ def _edge_over_breakeven(position: dict) -> float:
 
 def _eligible_for_floor(position: dict) -> bool:
     """
-    只有真正有正期望且自然仓位不太弱的标的，才允许被用于补足非冰点最低仓。
+    只有真正有正期望且自然仓位不太弱的标的，才允许被用于补足主升/震荡最低仓。
     这样能满足进攻仓位要求，同时避免把 1%-2% 的弱优势机会硬拉到重仓。
     """
     room = float(position.get("hard_cap", 0) or 0) - float(position.get("position", 0) or 0)
@@ -235,7 +235,7 @@ def portfolio_size(positions: list[dict], market_state: str, enforce_floor: bool
     """
     总仓控制：
     1. 超过市场上限时等比例压缩。
-    2. 非冰点低于最低进攻仓时，只在合格标的上补足，不突破单标的上限。
+    2. 主升/震荡低于最低进攻仓时，只在合格标的上补足，不突破单标的上限。
     3. 若合格标的容量不足，返回 floor_unmet，selection 必须重选标的或判定冰点。
     """
     cap = get_position_cap(market_state)
@@ -274,7 +274,7 @@ def portfolio_size(positions: list[dict], market_state: str, enforce_floor: bool
     cash = round(max(0.0, 100 - final_total), 1)
     cash_rule_ok = cash <= 40 or not requires_aggressive_deployment(market_state)
     if not cash_rule_ok:
-        flags.append("非冰点市场现金仍高于40%，selection 不可直接执行")
+        flags.append("主升/震荡市场现金仍高于40%，selection 不可直接执行")
 
     return {
         "positions": positions,

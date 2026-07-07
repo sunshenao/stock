@@ -177,7 +177,7 @@ def get_replay_market_environment(target_date: str) -> dict:
         "position_cap": cap,
         "note": (
             f"{target_date} 为历史目标日，ETF 排名只使用目标日及以前行情；"
-            "实时市场宽度不参与复盘判断。非冰点默认按最低 60% 进攻仓约束。"
+            "实时市场宽度不参与复盘判断；退潮期不强制最低进攻仓。"
         ),
     }
 
@@ -201,7 +201,7 @@ def _market_note(state: str, up_ratio: float) -> str:
     elif state == "震荡":
         return "市场分歧，优先保留主线仓位，弹性仓不追高"
     elif state == "退潮":
-        return "赚钱效应弱但非冰点，精选强方向，现金控制在40%以内"
+        return "赚钱效应弱，ETF 排名只作候选；不强制三标的，允许高现金等待主力确认"
     elif state == "冰点":
         return "极度恐慌，以现金为主，只保留最强方向的试探仓"
     else:

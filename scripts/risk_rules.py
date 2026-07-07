@@ -22,21 +22,21 @@ class PositionCap:
 MARKET_POSITION_CAPS: dict[str, PositionCap] = {
     "主升": PositionCap(80, 100),
     "震荡": PositionCap(60, 80),
-    # 用户要求：除冰点外，现金必须 <=40%，所以退潮/未知也至少部署 60%。
-    "退潮": PositionCap(60, 60),
+    # 退潮期：不再强制三标的/60%仓位；只做主力确认 + 新催化的方向。
+    "退潮": PositionCap(0, 40),
     # 退潮末期：多主线从加速期跌回观察/衰弱、或基准跌破 MA20*0.98，
     # 允许现金 50-70%，只做主力真流入的独立叙事。
     "退潮末期": PositionCap(30, 50),
     "冰点": PositionCap(20, 40),
-    "未知": PositionCap(60, 60),
+    "未知": PositionCap(0, 40),
 }
 
 MARKET_POSITION_FLOORS: dict[str, int] = {
     "主升": 80,
     "震荡": 60,
-    "退潮": 60,
+    "退潮": 0,
     "退潮末期": 30,
-    "未知": 60,
+    "未知": 0,
     "冰点": 20,
 }
 
@@ -103,13 +103,13 @@ def is_ice_point(market_state: str) -> bool:
 
 
 def is_defensive_state(market_state: str) -> bool:
-    """冰点或退潮末期，允许现金 > 40%。"""
-    return market_state in {"冰点", "退潮末期"}
+    """退潮/退潮末期/冰点允许现金 > 40%。"""
+    return market_state in {"退潮", "退潮末期", "冰点", "未知"}
 
 
 def requires_aggressive_deployment(market_state: str) -> bool:
-    """主升/震荡/退潮/未知必须尽量把现金压到 40% 以内；冰点和退潮末期允许高现金。"""
-    return not is_defensive_state(market_state)
+    """只有主升/震荡必须尽量把现金压到 40% 以内；退潮期不强制部署。"""
+    return market_state in {"主升", "震荡"}
 
 
 def get_market_discount(market_state: str) -> float:
