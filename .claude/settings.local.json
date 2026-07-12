@@ -88,7 +88,10 @@
       "Bash(head -12 codex/stock/__TRACKED_VAR__/etf_scan.md)",
       "Bash(echo \"...\")",
       "Bash(python scripts/walkforward.py)",
-      "Bash(python -c \"import scripts.walkforward as w; w._run_lt\\(w.all_dates\\(\\)[19:],5,'ma5',6,0,cost_bps=8.0,pick_mode='rev'\\)\")"
+      "Bash(python -c \"import scripts.walkforward as w; w._run_lt\\(w.all_dates\\(\\)[19:],5,'ma5',6,0,cost_bps=8.0,pick_mode='rev'\\)\")",
+      "Bash(PYTHONIOENCODING=utf-8 python -c ' *)",
+      "Bash(PYTHONIOENCODING=utf-8 python \"C:\\\\Users\\\\sunshenao\\\\.claude\\\\skills\\\\news-search\\\\scripts\\\\news_search.py\" \"云计算 算力 数据中心 AI 政策 订单 最新\" --size 6)",
+      "Bash(PYTHONIOENCODING=utf-8 python scripts/selection_guard.py codex/stock/2026-07-13/selection.md)"
     ]
   },
   "enableAllProjectMcpServers": true,
