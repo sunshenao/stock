@@ -459,7 +459,9 @@ def _validate_holdings(text: str, market_state: str | None, errors: list[str]) -
 
         # 追高硬门禁（规则 5：单日≥7%次日不追，看位置不只看幅度）
         # 默认：单日>7% → 仓位≤10%。例外：20日动量<-10%（超跌反弹）可放宽至标准仓位。
+        # 例外：扩散期方向不适用追高仓位限制（规则 11 优先）
         chase_ctx = context or holding.row_text
+        is_diffusion = "扩散期" in chase_ctx
         ret5 = _extract_5d_return(chase_ctx)
         if ret5 is None:
             ret5 = _lookup_metric(text, holding, _RET5_HEADERS)
@@ -467,21 +469,22 @@ def _validate_holdings(text: str, market_state: str | None, errors: list[str]) -
         if chg1 is None:
             chg1 = _lookup_metric(text, holding, _SINGLE_DAY_HEADERS)
         ret20 = _lookup_metric(text, holding, _RET20_HEADERS)
-        if holding.position_high > PROBE_POSITION_CAP:
-            if ret5 is not None and ret5 > CHASE_5D_RETURN_LIMIT:
-                errors.append(
-                    f"{holding.instrument} 5日动量 {ret5:+g}%>{CHASE_5D_RETURN_LIMIT:g}%，追高禁令要求仓位≤{PROBE_POSITION_CAP}%"
-                )
-            if chg1 is not None and chg1 > CHASE_SINGLE_DAY_LIMIT:
-                # 规则 5 超跌反弹例外：20日动量 < -10% 可放宽
-                if ret20 is not None and ret20 < _OVERSOLD_REBOUND_THRESHOLD:
-                    pass
-                else:
+        if not is_diffusion:
+            if holding.position_high > PROBE_POSITION_CAP:
+                if ret5 is not None and ret5 > CHASE_5D_RETURN_LIMIT:
                     errors.append(
-                        f"{holding.instrument} 单日 {chg1:+g}%>{CHASE_SINGLE_DAY_LIMIT:g}%，追高禁令要求仓位≤{PROBE_POSITION_CAP}%"
+                        f"{holding.instrument} 5日动量 {ret5:+g}%>{CHASE_5D_RETURN_LIMIT:g}%，追高禁令要求仓位≤{PROBE_POSITION_CAP}%"
                     )
+                if chg1 is not None and chg1 > CHASE_SINGLE_DAY_LIMIT:
+                    # 规则 5 超跌反弹例外：20日动量 < -10% 可放宽
+                    if ret20 is not None and ret20 < _OVERSOLD_REBOUND_THRESHOLD:
+                        pass
+                    else:
+                        errors.append(
+                            f"{holding.instrument} 单日 {chg1:+g}%>{CHASE_SINGLE_DAY_LIMIT:g}%，追高禁令要求仓位≤{PROBE_POSITION_CAP}%"
+                        )
 
-        if market_state in {"退潮", "退潮末期"}:
+        if market_state in {"退潮", }:  # 仅退潮，退潮末期不触发此限制（规则 9）
             has_catalyst = _has_clear_catalyst(chase_ctx)
             has_major_catalyst = _has_major_catalyst(chase_ctx)
             hold_only = _is_existing_or_hold_only(chase_ctx)
@@ -525,17 +528,9 @@ def validate_selection(path: Path) -> tuple[bool, list[str]]:
 
     if market_state and cash_range:
         cash_low, cash_high = cash_range
-        if requires_aggressive_deployment(market_state) and cash_high > 40:
+        if requires_aggressive_deployment(market_state) and cash_high > 5:
             errors.append(
-                f"非防守市场({market_state})现金上限为40%，当前现金区间为{cash_low:g}-{cash_high:g}%"
-            )
-        if market_state == "退潮末期" and cash_high > 70:
-            errors.append(
-                f"退潮末期现金上限为70%，当前现金区间为{cash_low:g}-{cash_high:g}%"
-            )
-        if market_state == "退潮末期" and cash_low < 50:
-            errors.append(
-                f"退潮末期现金下限为50%，当前现金区间为{cash_low:g}-{cash_high:g}%"
+                f"{market_state}要求满仓(现金≤5%)，当前现金区间为{cash_low:g}-{cash_high:g}%"
             )
 
     _validate_holdings(text, market_state, errors)

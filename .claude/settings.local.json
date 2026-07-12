@@ -82,7 +82,13 @@
       "Bash(python3 -m pip install --user pandas akshare tabulate)",
       "Bash(python3 *)",
       "Bash(echo \"rc=$?\")",
-      "mcp__cn-financial__search_news"
+      "mcp__cn-financial__search_news",
+      "Bash(cd \"C:/Users/sunshenao/Desktop/learn/vibe/大a\")",
+      "Bash(echo '=== __TRACKED_VAR__ ===')",
+      "Bash(head -12 codex/stock/__TRACKED_VAR__/etf_scan.md)",
+      "Bash(echo \"...\")",
+      "Bash(python scripts/walkforward.py)",
+      "Bash(python -c \"import scripts.walkforward as w; w._run_lt\\(w.all_dates\\(\\)[19:],5,'ma5',6,0,cost_bps=8.0,pick_mode='rev'\\)\")"
     ]
   },
   "enableAllProjectMcpServers": true,

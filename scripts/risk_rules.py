@@ -20,23 +20,21 @@ class PositionCap:
 
 
 MARKET_POSITION_CAPS: dict[str, PositionCap] = {
-    "主升": PositionCap(80, 100),
-    "震荡": PositionCap(60, 80),
-    # 退潮期：不再强制三标的/60%仓位；只做主力确认 + 新催化的方向。
-    "退潮": PositionCap(0, 40),
-    # 退潮末期：多主线从加速期跌回观察/衰弱、或基准跌破 MA20*0.98，
-    # 允许现金 50-70%，只做主力真流入的独立叙事。
-    "退潮末期": PositionCap(30, 50),
+    "主升": PositionCap(95, 100),
+    "震荡": PositionCap(95, 100),
+    # 退潮/退潮末期：涨跌比映射覆盖（<0.5→冰点, ≥0.5→100%），此标签作为冰点后备
+    "退潮": PositionCap(60, 80),
+    "退潮末期": PositionCap(95, 100),
     "冰点": PositionCap(20, 40),
-    "未知": PositionCap(0, 40),
+    "未知": PositionCap(95, 100),
 }
 
 MARKET_POSITION_FLOORS: dict[str, int] = {
-    "主升": 80,
-    "震荡": 60,
-    "退潮": 0,
-    "退潮末期": 30,
-    "未知": 0,
+    "主升": 95,
+    "震荡": 95,
+    "退潮": 60,
+    "退潮末期": 95,
+    "未知": 95,
     "冰点": 20,
 }
 
@@ -57,17 +55,17 @@ STAGE_BONUS: dict[str, float] = {
 }
 
 SINGLE_POSITION_CAPS: dict[str, int] = {
-    "stock": 35,
-    "etf": 35,
-    "lof": 35,
-    "qdii": 35,
+    "stock": 60,
+    "etf": 60,
+    "lof": 60,
+    "qdii": 60,
     "cash": 100,
 }
 
 STOCK_GRADE_CAPS: dict[str, int] = {
-    "A": 35,
-    "B": 30,
-    "C": 20,
+    "A": 60,
+    "B": 45,
+    "C": 25,
     "D": 0,
 }
 
@@ -103,13 +101,13 @@ def is_ice_point(market_state: str) -> bool:
 
 
 def is_defensive_state(market_state: str) -> bool:
-    """退潮/退潮末期/冰点允许现金 > 40%。"""
-    return market_state in {"退潮", "退潮末期", "冰点", "未知"}
+    """只有冰点允许现金 > 40%。退潮/退潮末期现金仍须 < 40%（规则 8/9）。"""
+    return market_state in {"冰点"}
 
 
 def requires_aggressive_deployment(market_state: str) -> bool:
-    """只有主升/震荡必须尽量把现金压到 40% 以内；退潮期不强制部署。"""
-    return market_state in {"主升", "震荡"}
+    """冰点以外所有市场状态均要求现金 < 40%（规则 8）。"""
+    return market_state not in {"冰点", "未知"}
 
 
 def get_market_discount(market_state: str) -> float:

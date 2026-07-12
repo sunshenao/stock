@@ -647,6 +647,17 @@ def calc_auto_score(
     if r5 > 5 and r20 < -2:
         bounce_penalty = 0.3
 
+    # 高位透支识别：已创新高 + 加速拉升 → 追买即接盘（机器人0703/科创材料0630教训）
+    # 评分不能把"刚冲到顶"的板块奖成第一，越透支越降权
+    accel_5d = float(m.get("accel_5d") or 0)
+    extension_penalty = 1.0
+    if m.get("is_20d_high") and accel_5d > 6:
+        extension_penalty = 0.8
+    if m.get("is_20d_high") and (pct > 6 or r5 > 12):
+        extension_penalty = 0.65
+    if "加速见顶" in stage or "加速期⚠" in stage:
+        extension_penalty = min(extension_penalty, 0.6)
+
     # 连续强于指数: 10 分（核心主线信号）
     trend_score = min(10.0, consecutive_strong * 1.2)
 
@@ -667,7 +678,7 @@ def calc_auto_score(
 
     catalyst_hints = {
         "扩散期": 10,
-        "加速期": 8,
+        "加速期": 4,
         "确认期": 6,
         "萌芽期": 4,
         "观察期": 2,
@@ -684,7 +695,7 @@ def calc_auto_score(
 
     raw_total = relative_score + volume_score + momentum_score + trend_score + liquidity_score + flow_score + catalyst_score + sentiment_bonus
     risk_factor, risk_note = premium_discount_factor(is_qdii=is_qdii, premium_pct=premium_pct)
-    total = raw_total * risk_factor * bounce_penalty
+    total = raw_total * risk_factor * bounce_penalty * extension_penalty
 
     return {
         "total": round(total, 1),
@@ -1384,6 +1395,30 @@ def main():
         f.write(report)
     display_path = f"codex/stock/{target_date}/etf_scan.md"
     print(f"  报告: {display_path} (data_source={target_date}{mode_note})", file=sys.stderr)
+
+    # 机器可读侧车 scan.json：供走前向引擎读取（含代码+收盘价，免手动补价）
+    import json as _json
+    scan_rows = []
+    for r in results:
+        m = r.get("metrics", {})
+        if "error" in m:
+            continue
+        stage = r.get("stage", ["", "", ""])
+        scan_rows.append({
+            "code": r.get("etf_code"),
+            "name": r.get("direction") or r.get("etf_name"),
+            "sector": r.get("category"),
+            "stage": stage[0] if stage else "",
+            "score": (r.get("score") or {}).get("total", 0.0),
+            "amount_yi": m.get("amount_yi"),
+            "pct": m.get("pct_chg"),
+            "close": m.get("close"),
+            "is_qdii": r.get("is_qdii", False),
+        })
+    scan_rows.sort(key=lambda x: -(x["score"] or 0))
+    with open(out_path.parent / "scan.json", "w", encoding="utf-8") as jf:
+        _json.dump({"date": target_date, "bench_pct": bench_pct, "rows": scan_rows},
+                   jf, ensure_ascii=False)
 
     # 终端摘要
     valid_count = sum(1 for r in results if "error" not in r["metrics"])
