@@ -659,7 +659,7 @@ class MarketDataCacheTests(unittest.TestCase):
                 calls.append((start, end))
                 return self._bars(start, end)
 
-            load_history(
+            initial = load_history(
                 "510300",
                 "20260101",
                 "20260120",
@@ -679,6 +679,30 @@ class MarketDataCacheTests(unittest.TestCase):
             self.assertEqual(calls[1], ("20260121", "20260220"))
             self.assertEqual(extended.attrs["network_calls"], 1)
             self.assertEqual(extended["date"].max(), pd.Timestamp("2026-02-20"))
+            persisted_path = root / "cache" / "bars" / "510300_ETF.csv"
+            persisted = pd.read_csv(persisted_path, parse_dates=["date"])
+            self.assertEqual(persisted["date"].min(), initial["date"].min())
+            self.assertEqual(persisted["date"].max(), extended["date"].max())
+            self.assertEqual(int(persisted["date"].duplicated().sum()), 0)
+
+            def forbidden_fetcher(*_args) -> pd.DataFrame:
+                raise AssertionError("persisted increment must be available offline")
+
+            offline = load_history(
+                "510300",
+                "20260101",
+                "20260220",
+                network_fetcher=forbidden_fetcher,
+                offline=True,
+                cache_root=root / "cache",
+                legacy_root=root / "legacy",
+            )
+            self.assertEqual(offline.attrs["network_calls"], 0)
+            pd.testing.assert_series_equal(
+                offline["close"].reset_index(drop=True),
+                extended["close"].reset_index(drop=True),
+                check_names=False,
+            )
 
     def test_monday_close_is_not_covered_by_previous_friday(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
