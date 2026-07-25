@@ -36,6 +36,7 @@ from risk_rules import (
     premium_discount_factor,
     risk_cluster,
 )
+from market_state import classify_market_state
 from skill_paths import find_hithink_cli, find_skill_scripts
 
 # Stock-analyzer-skill 路径（兼容 .claude/.codex/npm 全局安装）
@@ -174,17 +175,41 @@ def load_etf_txt(path: Path = ETF_TXT_PATH) -> OrderedDict:
 
 def get_market_environment() -> dict:
     """获取市场宽度数据，判断市场状态，给出仓位上限建议"""
+    fallback_state = "未知"
     try:
         from market_breadth import get_market_breadth, get_market_state
         breadth = get_market_breadth()
         state_info = get_market_state(breadth)
-        market_state = state_info["state"]
+        fallback_state = state_info["state"]
     except Exception:
         breadth = {"up_count": 0, "down_count": 0, "up_ratio": 0}
-        market_state = "未知"
+    up_ratio = breadth.get("up_ratio")
+    try:
+        end = pd.Timestamp.today().normalize()
+        start = end - timedelta(days=45)
+        benchmark = fetch_etf_hist(
+            BENCHMARK_CODE,
+            start.strftime("%Y%m%d"),
+            end.strftime("%Y%m%d"),
+            "ETF",
+        )
+        closes = benchmark.sort_values("date")["close"].astype(float).tail(20).tolist()
+        benchmark_pct = (
+            (closes[-1] / closes[-2] - 1) * 100
+            if len(closes) >= 2
+            else None
+        )
+        market_state = classify_market_state(
+            closes,
+            breadth_ratio=float(up_ratio) if up_ratio is not None else None,
+            benchmark_pct=benchmark_pct,
+        )
+        if market_state == "未知":
+            market_state = fallback_state
+    except Exception:
+        market_state = fallback_state
 
     cap = get_position_cap(market_state).text
-
     up_ratio = breadth.get("up_ratio", 0)
 
     return {
@@ -199,16 +224,38 @@ def get_market_environment() -> dict:
 
 def get_replay_market_environment(target_date: str) -> dict:
     """历史复盘禁止引用当前实时市场宽度，避免未来数据污染。"""
-    cap = get_position_cap("未知").text
+    target = pd.to_datetime(target_date)
+    state = "未知"
+    try:
+        benchmark = fetch_etf_hist(
+            BENCHMARK_CODE,
+            (target - timedelta(days=45)).strftime("%Y%m%d"),
+            target.strftime("%Y%m%d"),
+            "ETF",
+        )
+        closes = benchmark.sort_values("date")["close"].astype(float).tail(20).tolist()
+        benchmark_pct = (
+            (closes[-1] / closes[-2] - 1) * 100
+            if len(closes) >= 2
+            else None
+        )
+        state = classify_market_state(
+            closes,
+            breadth_ratio=None,
+            benchmark_pct=benchmark_pct,
+        )
+    except Exception:
+        pass
+    cap = get_position_cap(state).text
     return {
-        "market_state": "历史复盘",
+        "market_state": state,
         "up_count": "不使用实时宽度",
         "down_count": "不使用实时宽度",
         "up_ratio": "不使用实时宽度",
         "position_cap": cap,
         "note": (
             f"{target_date} 为历史目标日，ETF 排名只使用目标日及以前行情；"
-            "实时市场宽度不参与复盘判断；退潮期不强制最低进攻仓。"
+            "实时市场宽度不参与复盘判断；市场状态使用同一基准趋势规则。"
         ),
     }
 

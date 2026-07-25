@@ -7,6 +7,7 @@ treated as an executable plan.
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import sys
 from dataclasses import dataclass
@@ -39,6 +40,7 @@ RETREAT_RET20_NEW_POSITION_LIMIT = 15.0
 RETREAT_RET20_HOLD_ONLY_LIMIT = 25.0
 RETREAT_RET20_HIGH_RISK_LIMIT = 35.0
 WEEKLY_ALLOWED_WEEKDAYS = {0, 4, 5, 6}  # 周一盘前，或周五至周末
+EVIDENCE_FILENAME = "selection_evidence.json"
 
 
 @dataclass(frozen=True)
@@ -533,6 +535,107 @@ def _validate_holdings(
             errors.append(f"单一方向 {direction} 合计仓位 {exposure:g}% 超过 60%")
 
 
+def _parse_evidence_time(value: str) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone().replace(tzinfo=None)
+    return parsed
+
+
+def _text_cutoff(text: str, field: str) -> datetime | None:
+    match = re.search(rf"{re.escape(field)}\s*[：:]\s*([^\n|]+)", text)
+    if not match:
+        return None
+    value = match.group(1).strip().strip("*")
+    return _parse_evidence_time(value)
+
+
+def _validate_structured_evidence(
+    selection_path: Path,
+    text: str,
+    errors: list[str],
+) -> None:
+    evidence_path = selection_path.with_name(EVIDENCE_FILENAME)
+    if not evidence_path.exists():
+        errors.append(f"缺少 {EVIDENCE_FILENAME}，无法审计催化来源和已知时间")
+        return
+    try:
+        payload = json.loads(evidence_path.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError) as exc:
+        errors.append(f"{EVIDENCE_FILENAME} 无法解析: {exc}")
+        return
+
+    if payload.get("schema_version") != 1:
+        errors.append(f"{EVIDENCE_FILENAME} schema_version 必须为 1")
+    data_cutoff = _text_cutoff(text, "数据截止时间")
+    news_cutoff = _text_cutoff(text, "新闻截止时间")
+    payload_data_cutoff = _parse_evidence_time(payload.get("data_cutoff", ""))
+    payload_news_cutoff = _parse_evidence_time(payload.get("news_cutoff", ""))
+    if not payload_data_cutoff or not data_cutoff or payload_data_cutoff != data_cutoff:
+        errors.append("结构化证据 data_cutoff 必须与 selection 数据截止时间完全一致")
+    if not payload_news_cutoff or not news_cutoff or payload_news_cutoff != news_cutoff:
+        errors.append("结构化证据 news_cutoff 必须与 selection 新闻截止时间完全一致")
+
+    holdings = [
+        holding
+        for holding in _extract_portfolio_holdings(text)
+        if not holding.is_cash and holding.position_high > 0
+    ]
+    evidence_rows = payload.get("holdings")
+    if not isinstance(evidence_rows, list):
+        errors.append("结构化证据 holdings 必须为数组")
+        return
+    by_code = {
+        str(row.get("code")): row
+        for row in evidence_rows
+        if isinstance(row, dict) and row.get("code")
+    }
+    active_codes = {holding.code for holding in holdings if holding.code}
+    extra_codes = set(by_code) - active_codes
+    if extra_codes:
+        errors.append(f"结构化证据包含非组合代码: {', '.join(sorted(extra_codes))}")
+
+    for holding in holdings:
+        if not holding.code:
+            continue
+        row = by_code.get(holding.code)
+        if row is None:
+            errors.append(f"{holding.instrument} 缺少结构化证据")
+            continue
+        action = str(row.get("action") or "")
+        if action not in {"new", "hold", "reduce"}:
+            errors.append(f"{holding.instrument} action 必须为 new/hold/reduce")
+        thesis = str(row.get("thesis") or "").strip()
+        invalidation = str(row.get("invalidation") or "").strip()
+        if not thesis:
+            errors.append(f"{holding.instrument} 缺少可证伪 thesis")
+        if not invalidation:
+            errors.append(f"{holding.instrument} 缺少 invalidation")
+
+        if action != "new" or holding.position_high <= PROBE_POSITION_CAP:
+            continue
+        catalyst = row.get("catalyst")
+        if not isinstance(catalyst, dict):
+            errors.append(f"{holding.instrument} 新仓超过{PROBE_POSITION_CAP:g}%但缺少 catalyst")
+            continue
+        required = ("title", "known_at", "event_date", "source_name", "source_url")
+        missing = [field for field in required if not str(catalyst.get(field) or "").strip()]
+        if missing:
+            errors.append(f"{holding.instrument} catalyst 缺少字段: {', '.join(missing)}")
+            continue
+        known_at = _parse_evidence_time(catalyst["known_at"])
+        event_date = _parse_evidence_time(catalyst["event_date"])
+        if not known_at or not news_cutoff or known_at > news_cutoff:
+            errors.append(f"{holding.instrument} catalyst known_at 晚于新闻截止时间或格式无效")
+        if not event_date or not data_cutoff or event_date.date() < data_cutoff.date():
+            errors.append(f"{holding.instrument} catalyst event_date 不是数据截止后的待发生事件")
+        if not str(catalyst["source_url"]).startswith(("https://", "http://")):
+            errors.append(f"{holding.instrument} catalyst source_url 必须是可追溯链接")
+
+
 def validate_selection(path: Path) -> tuple[bool, list[str]]:
     text = path.read_text(encoding="utf-8-sig")
     errors = []
@@ -603,6 +706,7 @@ def validate_selection(path: Path) -> tuple[bool, list[str]]:
             )
 
     _validate_holdings(text, market_state, allowed_codes, errors)
+    _validate_structured_evidence(path, text, errors)
 
     if event_risk_match and event_risk_match.group(1) == "红色":
         for holding in _extract_portfolio_holdings(text):

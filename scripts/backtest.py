@@ -15,6 +15,8 @@ ETF 三层分析框架回测
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import timedelta
@@ -38,6 +40,9 @@ from etf_analyzer import (  # noqa: E402
     fetch_etf_hist,
     load_etf_txt,
 )
+from daily_risk import EXTREME_DAILY_DROP_PCT, cluster_crash_calendar  # noqa: E402
+from execution_model import cost_return_pct, simulate_long_with_stop  # noqa: E402
+from market_state import breadth_ratio_on_date, classify_from_history  # noqa: E402
 from risk_rules import (  # noqa: E402
     CORE_ENTRY_SCORE,
     FALLBACK_ENTRY_SCORE as POLICY_FALLBACK_ENTRY_SCORE,
@@ -48,6 +53,12 @@ from risk_rules import (  # noqa: E402
     new_position_trend_gate,
     risk_cluster,
 )
+from universe_history import (  # noqa: E402
+    active_codes as active_universe_codes,
+    load_registry,
+    registry_quality,
+)
+from strategy_version import load_current_manifest, verify_manifest  # noqa: E402
 
 HOLDABLE_STAGES = set(NEW_MONEY_STAGES) | {"趋势回撤期", "加速期⚠"}
 COMMODITY_CATEGORIES = {"商品", "资源"}
@@ -56,6 +67,7 @@ NORMAL_TRAIL_STOP = -18.0
 COMMODITY_PARABOLIC_R20 = 80.0
 COMMODITY_PARABOLIC_R60 = 150.0
 ONE_WAY_COST_BPS = 8.0
+STOP_SLIPPAGE_BPS = 10.0
 HISTORY_CACHE_DIR = PROJECT_ROOT / "codex" / "stock" / ".cache" / "etf_history"
 # 追高硬门禁：符合任一条件时该腿仅按试探仓 10% 建仓
 # 只在防守市场（退潮/退潮末期/冰点）触发；主升/震荡下真趋势不做机械稀释。
@@ -89,35 +101,24 @@ HOLD_BONUS = {
     "weekly": {"weak": 6.0, "normal": 6.0, "strong": 6.0},
     "monthly": {"weak": 6.0, "normal": 6.0, "strong": 6.0},
 }
+BENCHMARKS = {
+    "510300": "沪深300ETF",
+    "512500": "中证500ETF",
+    "159845": "中证1000ETF",
+    "159915": "创业板ETF",
+    "588080": "科创50ETF",
+}
 
 
-# 简易市场状态判断（回测无实时 market_breadth，用基准趋势替代）
-def _simple_market_state(bench_df, signal_date):
-    """
-    用沪深300 20日均线判断市场状态——保持简单，不过度拟合。
-
-    - close > MA20*1.02 → 主升
-    - close > MA20      → 震荡
-    - close > MA20*0.98 → 退潮 (-2% ~ 0)
-    - close > MA20*0.95 → 退潮末期 (-5% ~ -2%)
-    - else              → 冰点 (<-5%)
-    """
-    td = pd.to_datetime(signal_date)
-    recent = bench_df[bench_df["date"] <= td].tail(25)
-    if len(recent) < 22:
-        return "未知", get_target_exposure("未知") / 100
-    ma20 = recent["close"].iloc[-21:].mean()
-    close = recent["close"].iloc[-1]
-    if close > ma20 * 1.02:
-        return "主升", get_target_exposure("主升") / 100
-    elif close > ma20:
-        return "震荡", get_target_exposure("震荡") / 100
-    elif close > ma20 * 0.98:
-        return "退潮", get_target_exposure("退潮") / 100
-    elif close > ma20 * 0.95:
-        return "退潮末期", get_target_exposure("退潮末期") / 100
-    else:
-        return "冰点", get_target_exposure("冰点") / 100
+def _simple_market_state(bench_df, signal_date, data=None):
+    """Compatibility wrapper using the same regime rules as live diagnostics."""
+    width = breadth_ratio_on_date(data or {}, signal_date)
+    state = classify_from_history(
+        bench_df,
+        signal_date,
+        breadth_ratio=width,
+    )
+    return state, get_target_exposure(state) / 100
 
 
 def _fmt_date(ts) -> str:
@@ -152,9 +153,119 @@ def _last_between(df: pd.DataFrame, start, end) -> pd.Timestamp | None:
 def _max_drawdown(cumulative: pd.Series) -> float:
     if cumulative.empty:
         return 0.0
-    peak = cumulative.cummax()
+    peak = cumulative.cummax().clip(lower=1.0)
     dd = cumulative / peak - 1
     return round(float(dd.min()) * 100, 2)
+
+
+def _cost_sensitivity(
+    df: pd.DataFrame,
+    cost_grid_bps: tuple[float, ...] = (8.0, 15.0, 25.0),
+    daily_equity: pd.DataFrame | None = None,
+    base_cost_bps: float = ONE_WAY_COST_BPS,
+) -> pd.DataFrame:
+    """Reprice the same signals and fills under several transaction-cost tiers."""
+    if df.empty:
+        return pd.DataFrame()
+    gross = df.get("gross_return_pct", df["return_pct"] + df["cost_pct"])
+    rows = []
+    for bps in cost_grid_bps:
+        if daily_equity is not None and not daily_equity.empty and base_cost_bps > 0:
+            repriced_nav: list[float] = []
+            linked_nav = 1.0
+            ratio = float(bps) / float(base_cost_bps)
+            for _, period in daily_equity.groupby("period", sort=False):
+                cumulative_stop_cost = 0.0
+                entry_cost = float(period["entry_cost_pct"].sum()) * ratio / 100
+                for _, day in period.iterrows():
+                    cumulative_stop_cost += float(day["stop_cost_pct"]) * ratio / 100
+                    factor = float(day["gross_factor"]) - entry_cost - cumulative_stop_cost
+                    repriced_nav.append(linked_nav * factor)
+                linked_nav = repriced_nav[-1]
+            cumulative = pd.Series(repriced_nav)
+            cumulative_return = (float(cumulative.iloc[-1]) - 1) * 100
+            drawdown = _max_drawdown(cumulative)
+        else:
+            net_period = gross - df["turnover_pct"] / 100 * float(bps) / 100
+            cumulative = (1 + net_period / 100).cumprod()
+            cumulative_return = (float(cumulative.iloc[-1]) - 1) * 100
+            drawdown = _max_drawdown(cumulative)
+        rows.append({
+            "单边成本(bp)": float(bps),
+            "累计收益%": round(cumulative_return, 2),
+            "最大日度回撤%": drawdown,
+            "累计成本影响(百分点)": round(
+                float((df["turnover_pct"] / 100 * float(bps) / 100).sum()),
+                2,
+            ),
+        })
+    return pd.DataFrame(rows)
+
+
+def _benchmark_comparison(
+    data: dict[str, pd.DataFrame],
+    daily_equity: pd.DataFrame,
+) -> pd.DataFrame:
+    if daily_equity.empty:
+        return pd.DataFrame()
+    dates = pd.to_datetime(daily_equity["date"])
+    start = dates.min()
+    end = dates.max()
+    rows = []
+    for code, name in BENCHMARKS.items():
+        frame = data.get(code)
+        if frame is None or frame.empty:
+            continue
+        period = frame[(frame["date"] >= start) & (frame["date"] <= end)].sort_values("date")
+        if period.empty:
+            continue
+        entry = float(period.iloc[0].get("open", period.iloc[0]["close"]))
+        nav = period["close"].astype(float) / entry
+        rows.append({
+            "代码": code,
+            "基准": name,
+            "累计收益%": round((float(nav.iloc[-1]) - 1) * 100, 2),
+            "最大回撤%": _max_drawdown(nav),
+            "起始日": _fmt_date(period.iloc[0]["date"]),
+            "截止日": _fmt_date(period.iloc[-1]["date"]),
+        })
+
+    daily_returns: dict[pd.Timestamp, list[float]] = {}
+    target_dates = set(dates.dt.normalize())
+    for frame in data.values():
+        known = frame[frame["date"] <= end].sort_values("date").copy()
+        known["return"] = known["close"].pct_change()
+        for _, row in known[known["date"].dt.normalize().isin(target_dates)].iterrows():
+            value = row["return"]
+            if pd.isna(value):
+                continue
+            daily_returns.setdefault(pd.to_datetime(row["date"]).normalize(), []).append(float(value))
+    equal_weight_returns = pd.Series(
+        {
+            date: sum(values) / len(values)
+            for date, values in daily_returns.items()
+            if values
+        }
+    ).sort_index()
+    if not equal_weight_returns.empty:
+        equal_weight_nav = (1 + equal_weight_returns).cumprod()
+        rows.append({
+            "代码": "EW_POOL",
+            "基准": "当前固定ETF池等权（日频再平衡）",
+            "累计收益%": round((float(equal_weight_nav.iloc[-1]) - 1) * 100, 2),
+            "最大回撤%": _max_drawdown(equal_weight_nav),
+            "起始日": _fmt_date(equal_weight_nav.index[0]),
+            "截止日": _fmt_date(equal_weight_nav.index[-1]),
+        })
+    return pd.DataFrame(rows)
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _classify_loss_row(row: pd.Series) -> tuple[str, str]:
@@ -222,22 +333,26 @@ def _calc_atr(df: pd.DataFrame, as_of, period: int = 20) -> float | None:
     return float(atr_series.mean())
 
 
-def _simulate_period_return(
+def _simulate_period_path(
     df: pd.DataFrame,
     start,
     end,
     item: dict,
     freq: str,
     carry_price: float | None = None,
-) -> tuple[float, str, str, str]:
+    stop_slippage_bps: float = STOP_SLIPPAGE_BPS,
+    cluster_alerts: dict[pd.Timestamp, set[str]] | None = None,
+):
     """
-    用日线 low 模拟周期内止损。
+    用日线 OHLC 模拟周期内止损并返回逐日路径。
+
     新仓按周期第一个交易日开盘价买入；续持仓以上一期收盘标记价衔接，
-    因而不会漏掉周末/节假日跳空。止损从入场后的第一根日线开始判断。
+    因而不会漏掉周末/节假日跳空。第 t 日止损只使用 t-1 日以前的
+    峰值；跳空跌破止损时按开盘价并扣除滑点成交。
     """
     rows = df[(df["date"] >= pd.to_datetime(start)) & (df["date"] <= pd.to_datetime(end))].copy()
     if len(rows) < 2:
-        return 0.0, "", "", "数据不足"
+        return None
 
     rows = rows.sort_values("date").reset_index(drop=True)
     first = rows.iloc[0]
@@ -247,7 +362,7 @@ def _simulate_period_return(
         else float(first.get("open", first["close"]))
     )
     if entry_price <= 0:
-        return 0.0, "", "", "入场价无效"
+        return None
 
     # ATR 只能使用入场日前数据，禁止回测终点数据污染历史止损。
     atr = _calc_atr(df, pd.to_datetime(start) - timedelta(days=1), 20)
@@ -260,22 +375,214 @@ def _simulate_period_return(
         initial_stop_pct = max(rules["normal_initial"], ATR_MULTIPLIER * atr_pct)
         trailing_stop_pct = max(rules["normal_trailing"], ATR_MULTIPLIER * atr_pct * 1.3)
 
-    peak = entry_price
-    hard_stop = entry_price * (1 - initial_stop_pct)
+    forced_exit_dates: set[pd.Timestamp] = set()
+    item_cluster = risk_cluster(
+        item.get("category", "其他"),
+        item.get("industry", "其他"),
+        item.get("etf_name", ""),
+    )
+    day_returns: list[float] = []
+    prior_close = entry_price
     for _, row in rows.iterrows():
-        high = float(row["high"]) if "high" in rows.columns and pd.notna(row.get("high")) else float(row["close"])
-        low = float(row["low"]) if "low" in rows.columns and pd.notna(row.get("low")) else float(row["close"])
-        peak = max(peak, high)
-        trail_price = peak * (1 - trailing_stop_pct)
-        stop_price = max(hard_stop, trail_price)
+        close = float(row["close"])
+        day_returns.append((close / prior_close - 1) * 100)
+        prior_close = close
+    for exit_index in range(1, len(rows)):
+        trigger_index = exit_index - 1
+        trigger_date = pd.to_datetime(rows.iloc[trigger_index]["date"])
+        crashed_cluster = item_cluster in (cluster_alerts or {}).get(trigger_date, set())
+        if day_returns[trigger_index] <= EXTREME_DAILY_DROP_PCT or crashed_cluster:
+            forced_exit_dates.add(pd.to_datetime(rows.iloc[exit_index]["date"]))
 
-        if low <= stop_price:
-            ret = (stop_price / entry_price - 1) * 100
-            return ret, _fmt_date(first["date"]), _fmt_date(row["date"]), f"止损@{stop_price:.3f}"
+    return simulate_long_with_stop(
+        rows,
+        entry_price=entry_price,
+        initial_stop_pct=initial_stop_pct,
+        trailing_stop_pct=trailing_stop_pct,
+        slippage_bps=stop_slippage_bps,
+        forced_exit_dates=forced_exit_dates,
+    )
 
-    last = rows.iloc[-1]
-    ret = (float(last["close"]) / entry_price - 1) * 100
-    return ret, _fmt_date(first["date"]), _fmt_date(last["date"]), "持有到期"
+
+def _simulate_period_return(
+    df: pd.DataFrame,
+    start,
+    end,
+    item: dict,
+    freq: str,
+    carry_price: float | None = None,
+    stop_slippage_bps: float = STOP_SLIPPAGE_BPS,
+    cluster_alerts: dict[pd.Timestamp, set[str]] | None = None,
+) -> tuple[float, str, str, str]:
+    """Compatibility wrapper around the conservative daily path simulator."""
+    result = _simulate_period_path(
+        df,
+        start,
+        end,
+        item,
+        freq,
+        carry_price=carry_price,
+        stop_slippage_bps=stop_slippage_bps,
+        cluster_alerts=cluster_alerts,
+    )
+    if result is None:
+        return 0.0, "", "", "数据不足"
+    return result.return_pct, result.entry_date, result.exit_date, result.exit_note
+
+
+def _build_daily_period_path(
+    *,
+    label: str,
+    benchmark_rows: pd.DataFrame,
+    benchmark_entry: float,
+    selected: list[dict],
+    weights: list[float],
+    entry_turnover: float,
+    one_way_cost_bps: float,
+    nav_start: float,
+    benchmark_nav_start: float,
+    market_state: str,
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """Aggregate leg paths into reproducible daily equity and position records."""
+    calendar = [
+        pd.to_datetime(value)
+        for value in benchmark_rows.sort_values("date")["date"].tolist()
+    ]
+    leg_paths: dict[str, pd.DataFrame] = {}
+    for item in selected:
+        path = item["simulation"].path.copy()
+        path["date"] = pd.to_datetime(path["date"])
+        leg_paths[item["etf_code"]] = path.set_index("date")
+
+    entry_cost_fraction = cost_return_pct(entry_turnover, one_way_cost_bps) / 100
+    cumulative_stop_cost_fraction = 0.0
+    daily_rows: list[dict] = []
+    position_rows: list[dict] = []
+    stop_trades: list[dict] = []
+
+    for day_index, date in enumerate(calendar):
+        gross_factor = 1.0
+        active_value = 0.0
+        active_names: list[str] = []
+        stop_cost_today = 0.0
+        leg_snapshots: list[tuple[dict, float, pd.Series]] = []
+
+        for item, weight in zip(selected, weights):
+            path = leg_paths[item["etf_code"]]
+            if date not in path.index:
+                prior = path[path.index <= date]
+                if prior.empty:
+                    continue
+                leg_row = prior.iloc[-1]
+            else:
+                leg_row = path.loc[date]
+                if isinstance(leg_row, pd.DataFrame):
+                    leg_row = leg_row.iloc[-1]
+
+            factor = float(leg_row["factor"])
+            gross_factor += float(weight) * (factor - 1)
+            is_active = bool(leg_row["active"])
+            if is_active:
+                active_value += float(weight) * factor
+                active_names.append(item["etf_name"])
+            if pd.notna(leg_row.get("stop_fill")):
+                stop_cost_today += cost_return_pct(weight, one_way_cost_bps) / 100
+                stop_trades.append({
+                    "date": _fmt_date(date),
+                    "period": label,
+                    "code": item["etf_code"],
+                    "name": item["etf_name"],
+                    "side": "STOP_SELL",
+                    "weight_change_pct": round(float(weight) * 100, 2),
+                    "execution_price": round(float(leg_row["stop_fill"]), 6),
+                    "cost_bps": float(one_way_cost_bps),
+                    "reason": str(leg_row.get("stop_reason") or "止损"),
+                })
+            leg_snapshots.append((item, float(weight), leg_row))
+
+        cumulative_stop_cost_fraction += stop_cost_today
+        net_factor = gross_factor - entry_cost_fraction - cumulative_stop_cost_fraction
+        nav = nav_start * net_factor
+        benchmark_row = benchmark_rows[
+            pd.to_datetime(benchmark_rows["date"]) == date
+        ].iloc[-1]
+        benchmark_factor = float(benchmark_row["close"]) / float(benchmark_entry)
+        benchmark_nav = benchmark_nav_start * benchmark_factor
+        cash_value = max(net_factor - active_value, 0.0)
+        cash_weight = 100.0 if net_factor <= 0 else cash_value / net_factor * 100
+
+        daily_rows.append({
+            "date": _fmt_date(date),
+            "period": label,
+            "market_state": market_state,
+            "nav": nav,
+            "benchmark_nav": benchmark_nav,
+            "gross_factor": gross_factor,
+            "entry_cost_pct": entry_cost_fraction * 100 if day_index == 0 else 0.0,
+            "stop_cost_pct": stop_cost_today * 100,
+            "cash_weight_pct": cash_weight,
+            "holdings": ", ".join(active_names) if active_names else "现金",
+        })
+        for item, weight, leg_row in leg_snapshots:
+            if not bool(leg_row["active"]):
+                continue
+            position_rows.append({
+                "date": _fmt_date(date),
+                "period": label,
+                "code": item["etf_code"],
+                "name": item["etf_name"],
+                "target_weight_pct": round(weight * 100, 2),
+                "mark_price": round(float(leg_row["mark_price"]), 6),
+                "market_value_factor": round(weight * float(leg_row["factor"]), 8),
+            })
+
+    return daily_rows, position_rows, stop_trades
+
+
+def _finalize_daily_equity(records: list[dict]) -> pd.DataFrame:
+    if not records:
+        return pd.DataFrame()
+    daily = pd.DataFrame(records)
+    daily["date"] = pd.to_datetime(daily["date"])
+    daily = daily.sort_values("date").drop_duplicates("date", keep="last").reset_index(drop=True)
+    daily["daily_return_pct"] = daily["nav"].pct_change().fillna(daily["nav"] - 1) * 100
+    daily["drawdown_pct"] = (
+        daily["nav"] / daily["nav"].cummax().clip(lower=1.0) - 1
+    ) * 100
+    daily["benchmark_daily_return_pct"] = (
+        daily["benchmark_nav"].pct_change().fillna(daily["benchmark_nav"] - 1) * 100
+    )
+    return daily
+
+
+def _build_cash_daily_path(
+    *,
+    label: str,
+    benchmark_rows: pd.DataFrame,
+    benchmark_entry: float,
+    nav_start: float,
+    benchmark_nav_start: float,
+    exit_turnover: float,
+    one_way_cost_bps: float,
+    market_state: str,
+) -> list[dict]:
+    cost_fraction = cost_return_pct(exit_turnover, one_way_cost_bps) / 100
+    records = []
+    for index, (_, row) in enumerate(benchmark_rows.sort_values("date").iterrows()):
+        benchmark_factor = float(row["close"]) / float(benchmark_entry)
+        records.append({
+            "date": _fmt_date(row["date"]),
+            "period": label,
+            "market_state": market_state,
+            "nav": nav_start * (1 - cost_fraction),
+            "benchmark_nav": benchmark_nav_start * benchmark_factor,
+            "gross_factor": 1.0,
+            "entry_cost_pct": cost_fraction * 100 if index == 0 else 0.0,
+            "stop_cost_pct": 0.0,
+            "cash_weight_pct": 100.0,
+            "holdings": "现金",
+        })
+    return records
 
 
 def _last_row_on_or_before(df: pd.DataFrame, dt) -> pd.Series | None:
@@ -618,6 +925,7 @@ def rank_on_signal_date(
     signal_date: pd.Timestamp,
     min_amount_yi: float,
     allowed_stages: set[str] | None = NEW_MONEY_STAGES,
+    allowed_codes: set[str] | None = None,
 ) -> list[dict]:
     signal_date_str = _fmt_date(signal_date)
     bench_metrics = calc_etf_metrics(bench_df, signal_date_str)
@@ -625,6 +933,8 @@ def rank_on_signal_date(
 
     ranked = []
     for direction, cfg in etf_pool.items():
+        if allowed_codes is not None and cfg["code"] not in allowed_codes:
+            continue
         if cfg.get("cat") == "货币":
             continue
         df = data.get(cfg["code"])
@@ -679,6 +989,8 @@ def run_backtest(
     max_etfs: int | None = None,
     freq: str = "monthly",
     refresh_cache: bool = False,
+    one_way_cost_bps: float = ONE_WAY_COST_BPS,
+    stop_slippage_bps: float = STOP_SLIPPAGE_BPS,
 ) -> pd.DataFrame:
     if top_n != TARGET_SELECTION_COUNT:
         raise ValueError(f"正式组合固定选择 {TARGET_SELECTION_COUNT} 只标的，不能使用 top_n={top_n}")
@@ -713,10 +1025,18 @@ def run_backtest(
         raise RuntimeError("沪深300ETF 基准行情获取失败")
 
     data = fetch_all_hist(etf_pool, fetch_start, fetch_end, refresh_cache)
+    cluster_alerts = cluster_crash_calendar(etf_pool, data, start_dt, end_dt)
+    universe_registry = load_registry()
+    universe_status = registry_quality(universe_registry)
     periods = _periods(start_dt, end_dt, freq)
     rows = []
     holdings: dict[str, dict] = {}
     benchmark_mark_price: float | None = None
+    portfolio_nav = 1.0
+    benchmark_nav = 1.0
+    daily_records: list[dict] = []
+    position_records: list[dict] = []
+    trade_records: list[dict] = []
 
     for label, period_start, period_end in periods:
         signal_date = _latest_before(bench_df, period_start)
@@ -724,7 +1044,7 @@ def run_backtest(
         exit_date = _last_between(bench_df, period_start, period_end)
         if signal_date is None or entry_date is None or exit_date is None or entry_date >= exit_date:
             continue
-        market_state, _ = _simple_market_state(bench_df, signal_date)
+        market_state, _ = _simple_market_state(bench_df, signal_date, data)
         benchmark_rows = bench_df[
             (bench_df["date"] >= entry_date) & (bench_df["date"] <= exit_date)
         ].sort_values("date")
@@ -746,11 +1066,28 @@ def run_backtest(
             signal_date,
             effective_min_amount_yi,
             allowed_stages=None,
+            allowed_codes=(
+                active_universe_codes(universe_registry, signal_date)
+                if not universe_registry.empty
+                else None
+            ),
         )
         if not ranked_all:
             print(f"  {label}: 无候选标的")
             exit_turnover = sum(float(item.get("weight", 0.0)) for item in holdings.values())
-            exit_cost_pct = exit_turnover * ONE_WAY_COST_BPS / 100
+            exit_cost_pct = cost_return_pct(exit_turnover, one_way_cost_bps)
+            daily_records.extend(_build_cash_daily_path(
+                label=label,
+                benchmark_rows=benchmark_rows,
+                benchmark_entry=benchmark_entry,
+                nav_start=portfolio_nav,
+                benchmark_nav_start=benchmark_nav,
+                exit_turnover=exit_turnover,
+                one_way_cost_bps=one_way_cost_bps,
+                market_state=market_state,
+            ))
+            portfolio_nav *= 1 - exit_cost_pct / 100
+            benchmark_nav *= 1 + bench_ret / 100
             rows.append({
                 "month": label,
                 "signal_date": _fmt_date(signal_date),
@@ -881,28 +1218,43 @@ def run_backtest(
         returns = []
         realized_selected = []
         for r in selected:
-            period_ret, real_entry, real_exit, exit_note = _simulate_period_return(
+            simulation = _simulate_period_path(
                 data[r["etf_code"]],
                 entry_date,
                 exit_date,
                 r,
                 freq,
                 carry_price=r.get("carry_price"),
+                stop_slippage_bps=stop_slippage_bps,
+                cluster_alerts=cluster_alerts,
             )
-            if not real_entry:
+            if simulation is None:
                 continue
             realized_selected.append({
                 **r,
-                "period_return": period_ret,
-                "real_entry": real_entry,
-                "real_exit": real_exit,
-                "exit_note": exit_note,
+                "period_return": simulation.return_pct,
+                "real_entry": simulation.entry_date,
+                "real_exit": simulation.exit_date,
+                "exit_note": simulation.exit_note,
+                "simulation": simulation,
             })
-            returns.append(period_ret)
+            returns.append(simulation.return_pct)
 
         if not realized_selected:
             exit_turnover = sum(float(item.get("weight", 0.0)) for item in holdings.values())
-            exit_cost_pct = exit_turnover * ONE_WAY_COST_BPS / 100
+            exit_cost_pct = cost_return_pct(exit_turnover, one_way_cost_bps)
+            daily_records.extend(_build_cash_daily_path(
+                label=label,
+                benchmark_rows=benchmark_rows,
+                benchmark_entry=benchmark_entry,
+                nav_start=portfolio_nav,
+                benchmark_nav_start=benchmark_nav,
+                exit_turnover=exit_turnover,
+                one_way_cost_bps=one_way_cost_bps,
+                market_state=market_state,
+            ))
+            portfolio_nav *= 1 - exit_cost_pct / 100
+            benchmark_nav *= 1 + bench_ret / 100
             rows.append({
                 "month": label,
                 "signal_date": _fmt_date(signal_date),
@@ -962,9 +1314,56 @@ def run_backtest(
             for code in stopped_codes
         )
         total_turnover = entry_turnover + stop_turnover
-        cost_return_pct = total_turnover * ONE_WAY_COST_BPS / 100
+        cost_drag_pct = cost_return_pct(total_turnover, one_way_cost_bps)
         raw_return = sum(r["period_return"] for r in selected) / n_legs if n_legs else 0.0
-        portfolio_ret = weighted_sum - cost_return_pct
+        gross_return = weighted_sum
+        portfolio_ret = gross_return - cost_drag_pct
+        period_daily, period_positions, stop_trades = _build_daily_period_path(
+            label=label,
+            benchmark_rows=benchmark_rows,
+            benchmark_entry=benchmark_entry,
+            selected=selected,
+            weights=weights,
+            entry_turnover=entry_turnover,
+            one_way_cost_bps=one_way_cost_bps,
+            nav_start=portfolio_nav,
+            benchmark_nav_start=benchmark_nav,
+            market_state=market_state,
+        )
+        if period_daily:
+            daily_records.extend(period_daily)
+            position_records.extend(period_positions)
+            trade_records.extend(stop_trades)
+            period_end_nav = float(period_daily[-1]["nav"])
+            portfolio_ret = (period_end_nav / portfolio_nav - 1) * 100
+            portfolio_nav = period_end_nav
+            benchmark_nav = float(period_daily[-1]["benchmark_nav"])
+
+        for code in sorted(set(old_weights) | set(new_weights)):
+            delta = new_weights.get(code, 0.0) - old_weights.get(code, 0.0)
+            if abs(delta) < 1e-12:
+                continue
+            item = next(
+                (candidate for candidate in selected if candidate["etf_code"] == code),
+                holdings.get(code, {}),
+            )
+            simulation = item.get("simulation")
+            execution_price = (
+                float(simulation.entry_price)
+                if simulation is not None and delta > 0
+                else float(item.get("mark_price") or 0.0)
+            )
+            trade_records.append({
+                "date": _fmt_date(entry_date),
+                "period": label,
+                "code": code,
+                "name": item.get("etf_name", code),
+                "side": "BUY" if delta > 0 else "SELL",
+                "weight_change_pct": round(abs(delta) * 100, 2),
+                "execution_price": round(execution_price, 6),
+                "cost_bps": float(one_way_cost_bps),
+                "reason": "周度/周期调仓",
+            })
         contributions = sorted(
             (
                 (
@@ -1041,8 +1440,9 @@ def run_backtest(
             "exposure": round(deployed_exposure * 100, 1),
             "selection_count": n_legs,
             "turnover_pct": round(total_turnover * 100, 1),
-            "cost_pct": round(cost_return_pct, 3),
+            "cost_pct": round(cost_drag_pct, 3),
             "return_pct": round(portfolio_ret, 2),
+            "gross_return_pct": round(gross_return, 3),
             "raw_return_pct": round(raw_return, 2),
             "benchmark_pct": round(bench_ret, 2),
             "top_names": ", ".join(
@@ -1096,11 +1496,29 @@ def run_backtest(
     df = pd.DataFrame(rows)
     df["cumulative"] = (1 + df["return_pct"] / 100).cumprod()
     df["benchmark_cumulative"] = (1 + df["benchmark_pct"] / 100).cumprod()
+    daily_equity = _finalize_daily_equity(daily_records)
+    if not daily_equity.empty:
+        # Daily equity is authoritative; period NAV is retained for readable summaries.
+        period_nav = daily_equity.groupby("period", sort=False)["nav"].last()
+        df["cumulative"] = df["month"].map(period_nav).fillna(df["cumulative"])
+        period_benchmark_nav = daily_equity.groupby("period", sort=False)["benchmark_nav"].last()
+        df["benchmark_cumulative"] = df["month"].map(period_benchmark_nav).fillna(
+            df["benchmark_cumulative"]
+        )
     df.attrs["universe_size"] = len(etf_pool)
     df.attrs["max_etfs"] = max_etfs
     df.attrs["freq"] = freq
     df.attrs["effective_min_amount_yi"] = effective_min_amount_yi
     df.attrs["weekly_max_broad"] = WEEKLY_MAX_BROAD if freq == "weekly" else None
+    df.attrs["one_way_cost_bps"] = float(one_way_cost_bps)
+    df.attrs["stop_slippage_bps"] = float(stop_slippage_bps)
+    df.attrs["daily_equity"] = daily_equity
+    df.attrs["positions"] = pd.DataFrame(position_records)
+    df.attrs["trades"] = pd.DataFrame(trade_records).sort_values(
+        ["date", "side", "code"]
+    ).reset_index(drop=True) if trade_records else pd.DataFrame()
+    df.attrs["universe_quality"] = universe_status
+    df.attrs["benchmarks"] = _benchmark_comparison(data, daily_equity)
     return df
 
 
@@ -1127,12 +1545,44 @@ def write_report(
         out_path.write_text("# ETF 三层框架回测\n\n无有效回测结果。\n", encoding="utf-8")
         return out_path
 
+    daily_equity = df.attrs.get("daily_equity", pd.DataFrame())
+    positions = df.attrs.get("positions", pd.DataFrame())
+    trades = df.attrs.get("trades", pd.DataFrame())
+    artifact_base = out_path.with_suffix("")
+    daily_path = artifact_base.with_name(artifact_base.name + "_daily_equity.csv")
+    positions_path = artifact_base.with_name(artifact_base.name + "_positions.csv")
+    trades_path = artifact_base.with_name(artifact_base.name + "_trades.csv")
+    run_manifest_path = artifact_base.with_name(artifact_base.name + "_run_manifest.json")
+    if isinstance(daily_equity, pd.DataFrame) and not daily_equity.empty:
+        daily_equity.to_csv(daily_path, index=False, encoding="utf-8-sig", date_format="%Y-%m-%d")
+    if isinstance(positions, pd.DataFrame):
+        positions.to_csv(positions_path, index=False, encoding="utf-8-sig")
+    if isinstance(trades, pd.DataFrame):
+        trades.to_csv(trades_path, index=False, encoding="utf-8-sig")
+
     period_label = "周度" if freq == "weekly" else "月度"
     period_return_label = "本周收益%" if freq == "weekly" else "本月收益%"
     latest_period_label = "最近完成周" if freq == "weekly" else "最近完成月"
     annual_factor = 52 if freq == "weekly" else 12
     period_std = df["return_pct"].std(ddof=0)
     sharpe = 0.0 if period_std == 0 else (df["return_pct"].mean() / period_std) * (annual_factor ** 0.5)
+    if isinstance(daily_equity, pd.DataFrame) and not daily_equity.empty:
+        daily_std = daily_equity["daily_return_pct"].std(ddof=0)
+        daily_sharpe = (
+            0.0
+            if daily_std == 0
+            else daily_equity["daily_return_pct"].mean() / daily_std * (252 ** 0.5)
+        )
+        max_drawdown = float(daily_equity["drawdown_pct"].min())
+        current_drawdown = float(daily_equity.iloc[-1]["drawdown_pct"])
+    else:
+        daily_sharpe = sharpe
+        max_drawdown = _max_drawdown(df["cumulative"])
+        current_drawdown = (
+            float(df["cumulative"].iloc[-1])
+            / float(df["cumulative"].cummax().iloc[-1])
+            - 1
+        ) * 100
     total_ret = (df["cumulative"].iloc[-1] - 1) * 100
     bench_ret = (df["benchmark_cumulative"].iloc[-1] - 1) * 100
     latest = df.iloc[-1]
@@ -1141,9 +1591,76 @@ def write_report(
     actual_start = str(df.iloc[0]["entry_date"])
     actual_end = str(latest["exit_date"])
     ending_nav = float(latest["cumulative"])
-    current_drawdown = (
-        ending_nav / float(df["cumulative"].cummax().iloc[-1]) - 1
-    ) * 100
+    active_cost_bps = float(df.attrs.get("one_way_cost_bps", ONE_WAY_COST_BPS))
+    active_slippage_bps = float(df.attrs.get("stop_slippage_bps", STOP_SLIPPAGE_BPS))
+    sensitivity = _cost_sensitivity(
+        df,
+        daily_equity=daily_equity,
+        base_cost_bps=active_cost_bps,
+    )
+    benchmark_table = df.attrs.get("benchmarks", pd.DataFrame())
+    strategy_manifest = load_current_manifest()
+    strategy_version = "未冻结"
+    strategy_hash = "—"
+    strategy_integrity = False
+    strategy_errors: list[str] = ["缺少策略版本清单"]
+    forward_start = None
+    minimum_forward_weeks = 26
+    if strategy_manifest:
+        strategy_version = str(strategy_manifest.get("strategy_version", "未知"))
+        strategy_hash = str(strategy_manifest.get("combined_sha256", "—"))
+        strategy_integrity, strategy_errors = verify_manifest(strategy_manifest)
+        forward_start = pd.to_datetime(strategy_manifest.get("forward_start"), errors="coerce")
+        minimum_forward_weeks = int(strategy_manifest.get("minimum_forward_weeks", 26))
+    forward_days = 0
+    sample_label = "历史回放（非样本外）"
+    if (
+        forward_start is not None
+        and not pd.isna(forward_start)
+        and isinstance(daily_equity, pd.DataFrame)
+        and not daily_equity.empty
+    ):
+        forward_days = int((pd.to_datetime(daily_equity["date"]) >= forward_start).sum())
+        if forward_days == len(daily_equity):
+            sample_label = "冻结后前向记录"
+        elif forward_days > 0:
+            sample_label = "历史回放与冻结后前向记录混合"
+    forward_weeks = forward_days / 5
+    universe_quality = str(df.attrs.get("universe_quality", "missing"))
+
+    artifact_hashes = {}
+    for artifact in (daily_path, positions_path, trades_path):
+        if artifact.exists():
+            artifact_hashes[artifact.name] = _file_sha256(artifact)
+    run_manifest = {
+        "schema_version": 1,
+        "strategy_version": strategy_version,
+        "strategy_sha256": strategy_hash,
+        "strategy_integrity": strategy_integrity,
+        "strategy_integrity_errors": strategy_errors,
+        "sample_classification": sample_label,
+        "forward_start": None if forward_start is None or pd.isna(forward_start) else _fmt_date(forward_start),
+        "forward_observed_trading_days": forward_days,
+        "minimum_forward_weeks": minimum_forward_weeks,
+        "parameters": {
+            "start": start_date,
+            "end": end_date,
+            "frequency": freq,
+            "top_n": top_n,
+            "minimum_amount_yi": min_amount_yi,
+            "one_way_cost_bps": active_cost_bps,
+            "stop_slippage_bps": active_slippage_bps,
+        },
+        "universe_quality": universe_quality,
+        "universe_file_sha256": _file_sha256(SCRIPT_DIR / "etf_universe_history.csv")
+        if (SCRIPT_DIR / "etf_universe_history.csv").exists()
+        else None,
+        "artifacts": artifact_hashes,
+    }
+    run_manifest_path.write_text(
+        json.dumps(run_manifest, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
     effective_min_amount_yi = df.attrs.get("effective_min_amount_yi", min_amount_yi)
     weekly_broad_rule = (
         f"- 周度组合最多保留 {df.attrs.get('weekly_max_broad', WEEKLY_MAX_BROAD)} 个宽基，优先把席位留给产业方向。"
@@ -1223,6 +1740,9 @@ def write_report(
         f"- 区间超额收益：{total_ret - bench_ret:+.2f}%",
         f"- 期末净值：{ending_nav:.4f}（初始净值 1.0000）",
         f"- 期末距区间净值高点：{current_drawdown:.2f}%",
+        f"- 每日净值口径最大回撤：{max_drawdown:.2f}%",
+        f"- 样本性质：{sample_label}",
+        f"- 策略版本：{strategy_version}（完整性校验：{'通过' if strategy_integrity else '未通过'}）",
         "",
         "## 逐期收益",
         "",
@@ -1234,19 +1754,38 @@ def write_report(
         "",
         loss_table.to_markdown(index=False) if not loss_table.empty else "区间内无亏损周期。",
         "",
+        "## 多基准比较",
+        "",
+        benchmark_table.to_markdown(index=False)
+        if isinstance(benchmark_table, pd.DataFrame) and not benchmark_table.empty
+        else "无可用多基准数据。",
+        "",
+        "## 可复算产物",
+        "",
+        f"- 每日权益：`{daily_path.name}`",
+        f"- 每日持仓：`{positions_path.name}`",
+        f"- 成交与止损：`{trades_path.name}`",
+        f"- 运行清单：`{run_manifest_path.name}`",
+        "",
+        "## 成本敏感性",
+        "",
+        sensitivity.to_markdown(index=False),
+        "",
         "## 回测约束",
         "",
         f"- 调仓频率：{period_label}。",
         "- 信号日为调仓周期开始前最后一个交易日。",
         "- 选 ETF 只使用信号日及以前数据。",
+        "- 市场状态由沪深300趋势和ETF池涨跌比共同判断，与实时/日度诊断共用 `market_state.py`。",
         "- 周期初先判断旧持仓是否仍可续持，再让旧仓和新候选统一竞争 TOP 组合。",
         "- 续持只使用信号日及以前数据；不使用当月未来收益决定是否持有。",
         weekly_broad_rule,
         "- 新仓按周期第一个交易日开盘成交；续持仓沿用上一周期收盘标记价，保留周末和节假日跳空收益。",
-        "- 周期内用日线 low 模拟止损，触发后按止损价退出。",
+        "- 第 t 日止损价只使用 t-1 日以前的峰值；盘中触发按止损价减滑点成交，跳空跌破则按开盘价减滑点成交。",
+        "- 单标的单日跌幅达到7%或同风险簇至少3个细分方向单日跌超5%，在下一交易日开盘执行日度风控退出，当周不换入新标的。",
         "- 市场目标仓位统一为：主升100%、震荡90%、退潮70%、退潮末期60%、冰点40%。",
         "- 每期固定三只标的，按排名分配目标仓位的40%/35%/25%。",
-        f"- 所有仓位变化计入单边 {ONE_WAY_COST_BPS:g}bp 交易成本。",
+        f"- 所有仓位变化计入单边 {active_cost_bps:g}bp 交易成本；止损成交另计 {active_slippage_bps:g}bp 滑点。",
         "- 不使用当月已实现收益排序，避免未来函数。",
         "- 商品/资源/LOF 使用更宽的趋势止损，避免强主升浪中被普通行业 ETF 阈值过早洗出。",
         f"- 防守市场追高硬门禁：单日 >{CHASE_SINGLE_DAY_LIMIT:g}% 或 5日 >{CHASE_5D_RETURN_LIMIT:g}% → 不新开仓。",
@@ -1265,6 +1804,7 @@ def write_report(
         f"- 商品/LOF 趋势止损：高点回撤 {abs(COMMODITY_TRAIL_STOP):.0f}% 且跌破 MA20",
         f"- 商品/LOF 抛物线止盈：20日涨幅≥{COMMODITY_PARABOLIC_R20:.0f}% 且60日涨幅≥{COMMODITY_PARABOLIC_R60:.0f}%",
         f"- 实际回测标的数：{df.attrs.get('universe_size', '未知')}",
+        f"- 点时ETF池质量：{universe_quality}",
         f"- `--max-etfs`：{df.attrs.get('max_etfs') if df.attrs.get('max_etfs') else '未启用，全量'}",
         "",
         "## 结果",
@@ -1275,7 +1815,8 @@ def write_report(
         f"- {period_label}均收益：{df['return_pct'].mean():+.2f}%",
         f"- {period_label}胜率：{(df['return_pct'] > 0).sum() / len(df) * 100:.1f}%",
         f"- {period_label}夏普：{sharpe:.2f}",
-        f"- 最大回撤：{_max_drawdown(df['cumulative']):.2f}%",
+        f"- 日度夏普：{daily_sharpe:.2f}",
+        f"- 最大回撤（日度权益）：{max_drawdown:.2f}%",
         f"- 平均仓位：{df['exposure'].mean():.1f}%",
         f"- 三标的与目标仓位合规率：{policy_compliant.mean() * 100:.1f}%",
         f"- 累计单边换手：{df['turnover_pct'].sum() / 100:.2f} 倍",
@@ -1283,9 +1824,10 @@ def write_report(
         "",
         "## 结果限制",
         "",
-        "- 历史期统一使用当前 `scripts/etf.txt`，可能存在ETF池幸存者偏差；成立较晚的ETF会因无历史行情自然跳过，但历史已清盘或已移出池的产品不会出现。",
+        "- 初始 `etf_universe_history.csv` 是当前固定池回填，质量标记为 partial；它能阻止未来新增产品回写历史，但无法恢复首次快照前已清盘或已移出池的产品。",
+        f"- 冻结后前向样本当前约 {forward_weeks:.1f} 周；未达到 {minimum_forward_weeks} 周前，不用它宣称策略已通过样本外验证。",
         "- 回测只验证可时间点还原的价格、成交额和技术阶段，不包含无法完整归档的历史新闻、公告解读、实时主力资金和折溢价决策。",
-        "- 日线止损只能确认当日最高/最低是否触发，无法还原盘中先后顺序；实际滑点也可能高于统一的8bp假设。",
+        "- 日线 OHLC 仍无法还原完整盘中路径；当前模型使用前一日峰值、跳空开盘成交和独立止损滑点，结果仍应结合更高成本档压力测试。",
         "- 周度与月度结果来自同一历史区间，只是频率敏感性对照，不是彼此独立的样本外验证。",
         "",
         "## 明细",
@@ -1307,6 +1849,13 @@ def main():
     parser.add_argument("--freq", choices=["monthly", "weekly"], default="weekly", help="调仓频率")
     parser.add_argument("--output", help="报告输出路径；默认写入周度/月度标准报告")
     parser.add_argument("--refresh-cache", action="store_true", help="忽略本地行情缓存并重新下载")
+    parser.add_argument("--cost-bps", type=float, default=ONE_WAY_COST_BPS, help="单边交易成本，bp")
+    parser.add_argument(
+        "--stop-slippage-bps",
+        type=float,
+        default=STOP_SLIPPAGE_BPS,
+        help="止损成交额外滑点，bp",
+    )
     args = parser.parse_args()
 
     df = run_backtest(
@@ -1317,6 +1866,8 @@ def main():
         max_etfs=args.max_etfs,
         freq=args.freq,
         refresh_cache=args.refresh_cache,
+        one_way_cost_bps=args.cost_bps,
+        stop_slippage_bps=args.stop_slippage_bps,
     )
     out_path = write_report(
         df,

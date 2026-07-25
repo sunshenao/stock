@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from market_state import classify_market_state
 from risk_rules import (
     TARGET_SELECTION_COUNT,
     allocate_ranked_weights,
@@ -241,21 +242,12 @@ def _return_over_days(prices, code: str, dates: list[str], index: int, lookback:
 
 
 def _market_state_from_proxy(benchmark_nav: list[float], width: float, bench_pct: float) -> str:
-    """扫描快照缺少全A宽度时，用沪深300真实净值趋势为主、ETF宽度为辅。"""
-    nav = benchmark_nav[-1]
-    ma5 = sum(benchmark_nav[-5:]) / min(5, len(benchmark_nav))
-    ma20 = sum(benchmark_nav[-20:]) / min(20, len(benchmark_nav))
-    gap20 = nav / ma20 - 1 if ma20 else 0.0
-
-    if bench_pct <= -3.0 or (len(benchmark_nav) >= 20 and gap20 <= -0.05 and width < 0.5):
-        return "冰点"
-    if len(benchmark_nav) >= 20 and gap20 <= -0.02:
-        return "退潮末期"
-    if nav < ma20 or (nav < ma5 and width < 0.5):
-        return "退潮"
-    if nav >= ma5 and nav >= ma20 * 1.02 and width >= 1.0:
-        return "主升"
-    return "震荡"
+    """Backward-compatible wrapper around the shared regime classifier."""
+    return classify_market_state(
+        benchmark_nav,
+        breadth_ratio=width,
+        benchmark_pct=bench_pct,
+    )
 
 
 def _pick_ranked(

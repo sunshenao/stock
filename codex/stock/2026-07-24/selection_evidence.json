@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "data_cutoff": "2026-07-24 15:00",
+  "news_cutoff": "2026-07-25 22:55",
+  "holdings": [
+    {
+      "code": "159985",
+      "action": "new",
+      "thesis": "豆粕价格趋势处于扩散期，下一期美国作物进度与大豆生长状况将验证供给收紧交易是否延续。",
+      "invalidation": "USDA数据否定供给收紧且ETF跌破2.160。",
+      "catalyst": {
+        "title": "USDA Crop Progress",
+        "known_at": "2026-07-25 20:00",
+        "event_date": "2026-07-27T16:00:00-04:00",
+        "source_name": "USDA NASS",
+        "source_url": "https://data.nass.usda.gov/Publications/Calendar/reports_by_date.php?month=07&view=l&year=2026"
+      }
+    },
+    {
+      "code": "159981",
+      "action": "new",
+      "thesis": "能源化工短期动量转强，EIA库存数据用于验证原油供需是否继续支持价格弹性。",
+      "invalidation": "国际油价转弱且ETF未站稳1.500；已成交后跌破1.455。",
+      "catalyst": {
+        "title": "EIA Weekly Petroleum Status Report",
+        "known_at": "2026-07-25 20:00",
+        "event_date": "2026-07-29 22:30",
+        "source_name": "U.S. Energy Information Administration",
+        "source_url": "https://www.eia.gov/petroleum/supply/weekly/"
+      }
+    },
+    {
+      "code": "515180",
+      "action": "new",
+      "thesis": "退潮阶段以红利防御补位，半年度报告披露窗口用于验证成分股盈利和分红承接力。",
+      "invalidation": "风险偏好恢复使防御逻辑失效且ETF放量跌破1.315。",
+      "catalyst": {
+        "title": "A股半年度报告预约披露窗口",
+        "known_at": "2026-07-25 20:00",
+        "event_date": "2026-07-31 09:00",
+        "source_name": "巨潮资讯网",
+        "source_url": "https://www.cninfo.com.cn/new/commonUrl?url=data%2Fyuyuepilu"
+      }
+    }
+  ]
+}

@@ -4,6 +4,7 @@ from __future__ import annotations
 import sys
 import tempfile
 import unittest
+import json
 from pathlib import Path
 
 import pandas as pd
@@ -11,9 +12,17 @@ import pandas as pd
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from backtest import _calc_atr, _classify_loss_row, _should_hold_position  # noqa: E402
+from backtest import (  # noqa: E402
+    _calc_atr,
+    _classify_loss_row,
+    _cost_sensitivity,
+    _finalize_daily_equity,
+    _should_hold_position,
+)
 from backtest_current import ETFData, _market_state_from_proxy, run_backtest  # noqa: E402
+from daily_risk import detect_cluster_crashes  # noqa: E402
 from etf_analyzer import pick_formal_portfolio  # noqa: E402
+from execution_model import simulate_long_with_stop  # noqa: E402
 from event_risk import Event, event_snapshot  # noqa: E402
 from risk_rules import (  # noqa: E402
     CORE_ENTRY_SCORE,
@@ -26,6 +35,9 @@ from risk_rules import (  # noqa: E402
     risk_cluster,
 )
 from selection_guard import validate_selection  # noqa: E402
+from strategy_version import build_manifest, verify_manifest  # noqa: E402
+from universe_history import active_codes  # noqa: E402
+from walkforward_validate import build_folds  # noqa: E402
 
 
 def _selection_text(weights: tuple[float, float, float], cash: float = 10.0) -> str:
@@ -159,15 +171,54 @@ class RiskPolicyTests(unittest.TestCase):
 
 
 class SelectionGuardTests(unittest.TestCase):
-    def _validate(self, text: str) -> tuple[bool, list[str]]:
+    def _validate(
+        self,
+        text: str,
+        *,
+        write_evidence: bool = True,
+    ) -> tuple[bool, list[str]]:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "selection.md"
             path.write_text(text, encoding="utf-8")
+            if write_evidence:
+                evidence = {
+                    "schema_version": 1,
+                    "data_cutoff": "2026-01-09 15:00",
+                    "news_cutoff": "2026-01-09 20:00",
+                    "holdings": [
+                        {
+                            "code": code,
+                            "action": "new",
+                            "thesis": "价格趋势与事件验证同向",
+                            "invalidation": "价格跌破计划止损且事件证伪",
+                            "catalyst": {
+                                "title": "待发生官方数据",
+                                "known_at": "2026-01-09 19:00",
+                                "event_date": "2026-01-12 10:00",
+                                "source_name": "official",
+                                "source_url": "https://example.com/official",
+                            },
+                        }
+                        for code in ("159516", "515880", "515120")
+                    ],
+                }
+                path.with_name("selection_evidence.json").write_text(
+                    json.dumps(evidence, ensure_ascii=False),
+                    encoding="utf-8",
+                )
             return validate_selection(path)
 
     def test_valid_three_position_plan_passes(self) -> None:
         ok, errors = self._validate(_selection_text((36.0, 31.5, 22.5)))
         self.assertTrue(ok, errors)
+
+    def test_missing_structured_evidence_is_rejected(self) -> None:
+        ok, errors = self._validate(
+            _selection_text((36.0, 31.5, 22.5)),
+            write_evidence=False,
+        )
+        self.assertFalse(ok)
+        self.assertTrue(any("selection_evidence.json" in error for error in errors), errors)
 
     def test_daily_formal_selection_is_rejected(self) -> None:
         text = _selection_text((36.0, 31.5, 22.5)).replace(
@@ -202,6 +253,16 @@ class SelectionGuardTests(unittest.TestCase):
             path = Path(tmp) / "2026-07-22" / "selection.md"
             path.parent.mkdir()
             path.write_text(_selection_text((36.0, 31.5, 22.5)), encoding="utf-8")
+            evidence = {
+                "schema_version": 1,
+                "data_cutoff": "2026-01-09 15:00",
+                "news_cutoff": "2026-01-09 20:00",
+                "holdings": [],
+            }
+            path.with_name("selection_evidence.json").write_text(
+                json.dumps(evidence),
+                encoding="utf-8",
+            )
             ok, errors = validate_selection(path)
         self.assertFalse(ok)
         self.assertTrue(any("节假日特殊调仓" in error for error in errors), errors)
@@ -264,8 +325,8 @@ class PointInTimeTests(unittest.TestCase):
 
         self.assertAlmostEqual(log[0]["net_return"], 0.0)
         self.assertEqual(log[0]["executed_holdings"], "空仓")
-        self.assertAlmostEqual(log[1]["intraday_return"], 9.0)
-        expected = (1 - 0.072 / 100) * (1 + 9.0 / 100) - 1
+        self.assertAlmostEqual(log[1]["intraday_return"], 6.0)
+        expected = (1 - 0.048 / 100) * (1 + 6.0 / 100) - 1
         self.assertAlmostEqual(log[1]["net_return"], expected * 100)
 
     def test_first_day_market_state_uses_benchmark_warmup(self) -> None:
@@ -365,6 +426,152 @@ class PointInTimeTests(unittest.TestCase):
 
 
 class BacktestReportTests(unittest.TestCase):
+    def test_trailing_stop_uses_only_prior_day_peak(self) -> None:
+        rows = pd.DataFrame({
+            "date": pd.to_datetime(["2026-01-05", "2026-01-06"]),
+            "open": [100.0, 110.0],
+            "high": [120.0, 111.0],
+            "low": [95.0, 107.0],
+            "close": [110.0, 107.5],
+        })
+        result = simulate_long_with_stop(
+            rows,
+            entry_price=100.0,
+            initial_stop_pct=0.20,
+            trailing_stop_pct=0.10,
+            slippage_bps=0,
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(result.exit_date, "2026-01-06")
+        self.assertAlmostEqual(result.exit_price, 108.0)
+
+    def test_gap_below_stop_fills_at_open_less_slippage(self) -> None:
+        rows = pd.DataFrame({
+            "date": pd.to_datetime(["2026-01-05", "2026-01-06"]),
+            "open": [100.0, 80.0],
+            "high": [105.0, 82.0],
+            "low": [99.0, 75.0],
+            "close": [104.0, 78.0],
+        })
+        result = simulate_long_with_stop(
+            rows,
+            entry_price=100.0,
+            initial_stop_pct=0.10,
+            trailing_stop_pct=0.10,
+            slippage_bps=10,
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(result.exit_note.split("@")[0], "止损-跳空止损")
+        self.assertAlmostEqual(result.exit_price, 79.92)
+
+    def test_daily_risk_exit_executes_next_open(self) -> None:
+        rows = pd.DataFrame({
+            "date": pd.to_datetime(["2026-01-05", "2026-01-06"]),
+            "open": [100.0, 95.0],
+            "high": [101.0, 96.0],
+            "low": [99.0, 94.0],
+            "close": [100.0, 95.0],
+        })
+        result = simulate_long_with_stop(
+            rows,
+            entry_price=100.0,
+            initial_stop_pct=0.20,
+            trailing_stop_pct=0.20,
+            slippage_bps=0,
+            forced_exit_dates={pd.Timestamp("2026-01-06")},
+        )
+        self.assertEqual(result.exit_date, "2026-01-06")
+        self.assertEqual(result.exit_price, 95.0)
+        self.assertIn("日度风控次日开盘", result.exit_note)
+
+    def test_cluster_crash_requires_three_distinct_directions(self) -> None:
+        rows = [
+            {
+                "code": str(index),
+                "name": name,
+                "sector": sector,
+                "industry": industry,
+                "pct": -6.0,
+            }
+            for index, (name, sector, industry) in enumerate((
+                ("芯片ETF", "科技/芯片", "科技"),
+                ("通信ETF", "科技/通信", "科技"),
+                ("机器人ETF", "科技/机器人", "科技"),
+            ))
+        ]
+        self.assertEqual(detect_cluster_crashes(rows), {"高弹性成长"})
+
+    def test_daily_drawdown_catches_intraperiod_loss(self) -> None:
+        daily = _finalize_daily_equity([
+            {"date": "2026-01-05", "nav": 1.0, "benchmark_nav": 1.0},
+            {"date": "2026-01-06", "nav": 0.8, "benchmark_nav": 1.0},
+            {"date": "2026-01-09", "nav": 1.0, "benchmark_nav": 1.0},
+        ])
+        self.assertAlmostEqual(float(daily["drawdown_pct"].min()), -20.0)
+
+    def test_daily_drawdown_includes_initial_nav(self) -> None:
+        daily = _finalize_daily_equity([
+            {"date": "2026-01-05", "nav": 0.95, "benchmark_nav": 1.0},
+            {"date": "2026-01-06", "nav": 0.97, "benchmark_nav": 1.0},
+        ])
+        self.assertAlmostEqual(float(daily["drawdown_pct"].min()), -5.0)
+
+    def test_cost_sensitivity_is_monotonic(self) -> None:
+        frame = pd.DataFrame({
+            "gross_return_pct": [2.0, 1.0],
+            "return_pct": [1.9, 0.9],
+            "cost_pct": [0.1, 0.1],
+            "turnover_pct": [100.0, 100.0],
+        })
+        table = _cost_sensitivity(frame)
+        self.assertTrue(table["累计收益%"].is_monotonic_decreasing)
+
+    def test_strategy_manifest_verifies_current_files(self) -> None:
+        manifest = build_manifest(
+            "test",
+            frozen_at="2026-07-25 23:00",
+            forward_start="2026-07-27",
+        )
+        ok, errors = verify_manifest(manifest)
+        self.assertTrue(ok, errors)
+
+    def test_point_in_time_universe_respects_effective_dates(self) -> None:
+        registry = pd.DataFrame([
+            {
+                "code": "510300",
+                "effective_from": "2020-01-01",
+                "effective_to": "",
+            },
+            {
+                "code": "588080",
+                "effective_from": "2020-09-28",
+                "effective_to": "2026-01-31",
+            },
+        ])
+        self.assertEqual(active_codes(registry, "2020-06-01"), {"510300"})
+        self.assertEqual(
+            active_codes(registry, "2025-01-01"),
+            {"510300", "588080"},
+        )
+        self.assertEqual(active_codes(registry, "2026-02-01"), {"510300"})
+
+    def test_walkforward_folds_never_change_parameters(self) -> None:
+        periods = pd.DataFrame({
+            "month": [f"W{i}" for i in range(8)],
+            "entry_date": pd.date_range("2026-01-01", periods=8, freq="W").astype(str),
+            "exit_date": pd.date_range("2026-01-05", periods=8, freq="W").astype(str),
+            "return_pct": [1.0] * 8,
+            "benchmark_pct": [0.0] * 8,
+        })
+        daily = pd.DataFrame({
+            "period": [f"W{i}" for i in range(8)],
+            "nav": [1.0 + i * 0.01 for i in range(8)],
+        })
+        folds = build_folds(periods, daily, train_periods=4, test_periods=2)
+        self.assertEqual(len(folds), 2)
+        self.assertTrue(folds["complete_fold"].all())
+        self.assertTrue((folds["parameter_changes"] == 0).all())
+
     def test_loss_attribution_does_not_blame_market_when_benchmark_is_flat(self) -> None:
         row = pd.Series({
             "return_pct": -3.48,

@@ -14,6 +14,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from event_risk import DEFAULT_LEDGER, write_event_review
+from daily_risk import detect_cluster_crashes
 from risk_rules import get_target_exposure, risk_cluster
 from selection_guard import _extract_portfolio_holdings, validate_selection
 
@@ -125,24 +126,6 @@ def _latest_weekly_model(target_date: str, max_age_days: int = 8) -> tuple[Path 
     return None, []
 
 
-def _cluster_crashes(rows: list[dict]) -> set[str]:
-    weak_members: dict[str, set[str]] = {}
-    for row in rows:
-        if float(row.get("pct") or 0) > -5:
-            continue
-        cluster = risk_cluster(
-            str(row.get("sector") or "").split("/", 1)[0],
-            row.get("industry", "其他"),
-            row.get("name", ""),
-        )
-        weak_members.setdefault(cluster, set()).add(str(row.get("sector") or row.get("name")))
-    return {
-        cluster
-        for cluster, members in weak_members.items()
-        if len(members) >= 3
-    }
-
-
 def _write_daily_risk_review(
     target_date: str,
     scan_path: Path,
@@ -158,7 +141,7 @@ def _write_daily_risk_review(
     selection_path = None
     if not positions:
         selection_path, positions = _latest_weekly_model(target_date)
-    cluster_crashes = _cluster_crashes(rows)
+    cluster_crashes = detect_cluster_crashes(rows)
     blocked_scopes = set(event_snapshot.get("blocked_scopes") or [])
     global_red = event_snapshot.get("risk_level") == "红色"
 
