@@ -3,7 +3,7 @@ ETF 板块三层分析脚本
 ====================
 第一层：市场环境（市场宽度 → 总仓位上限）
 第二层：板块阶段（ETF动量 + 行业差异化阈值 → 板块生命周期 + 动作建议）
-第三层：个股映射（输出方向，个股选择在 Claude Code 对话中完成）
+第三层：池内标的比较（所有正式候选均来自 scripts/etf.txt）
 
 用法：
   python scripts/etf_analyzer.py --date 2026-06-29
@@ -26,7 +26,16 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from risk_rules import get_position_cap, premium_discount_factor
+from risk_rules import (
+    CORE_ENTRY_SCORE,
+    FALLBACK_ENTRY_SCORE,
+    MAX_SAME_RISK_CLUSTER,
+    allocate_ranked_weights,
+    get_position_cap,
+    new_position_trend_gate,
+    premium_discount_factor,
+    risk_cluster,
+)
 from skill_paths import find_hithink_cli, find_skill_scripts
 
 # Stock-analyzer-skill 路径（兼容 .claude/.codex/npm 全局安装）
@@ -68,19 +77,41 @@ from risk_rules import INDUSTRY_THRESHOLDS
 
 
 def _infer_industry(category: str, direction: str, name: str) -> str:
-    """根据分类和名称推导行业大类（txt 文件中没有 ind 列时兜底用）。"""
+    """根据分类和名称推导行业大类（txt 文件中没有 ind 列时兜底用）。
+
+    支持两种 category 格式：
+    - 旧格式: "科技", "医药", "消费" 等
+    - 新格式: "科技/半导体", "医药/创新药" 等（大类/细分）
+    """
+    # 提取大类（兼容 大类/细分 格式）
+    major_cat = category.split("/")[0] if "/" in category else category
+
+    # 名称关键词优先
     if any(word in direction + name for word in ("白银", "黄金", "原油", "豆粕", "商品")):
         return "周期"
     if any(word in direction + name for word in ("芯片", "半导体", "信息科技", "互联网", "数据", "数字")):
         return "科技"
     if any(word in direction + name for word in ("创新药", "生物医药", "生物科技", "医药", "医疗", "中药")):
         return "医药"
+
+    # 大类映射
+    major_to_ind = {
+        "科技": "科技", "医药": "医药", "消费": "消费", "金融": "金融",
+        "资源": "周期", "商品": "周期", "新能源": "新能源", "军工": "军工",
+        "公用事业": "公用事业", "红利": "红利", "债券": "债券", "货币": "债券",
+        "跨境": "跨境", "宽基": "宽基", "LOF": "其他", "其他": "其他",
+    }
+    if major_cat in major_to_ind:
+        mapped = major_to_ind[major_cat]
+        if mapped == "其他":
+            tech_words = ("数据", "信息", "专精特新", "绿色能源")
+            return "科技" if any(word in direction + name for word in tech_words) else "消费"
+        return mapped
+
+    # 兜底：原来 INDUSTRY_THRESHOLDS 的兼容逻辑
     if category in INDUSTRY_THRESHOLDS:
         if category in {"资源", "商品"}:
             return "周期"
-        if category == "其他":
-            tech_words = ("数据", "信息", "专精特新", "绿色能源")
-            return "科技" if any(word in direction + name for word in tech_words) else "消费"
         if category == "货币":
             return "债券"
         return category
@@ -625,17 +656,27 @@ def calc_auto_score(
     amount_yi = float(m.get("amount_yi") or 0)
     relative = pct - bench_pct
 
-    # 相对涨幅: 20 分
-    relative_score = _clip((relative + 2) / 10 * 20, 0, 20)
-    # 成交额放大: 20 分
-    volume_score = _clip((amount_ratio - 0.7) / 1.5 * 20, 0, 20)
+    # 相对强度 15 分。避免单日涨幅、5日动量、阶段分重复占据大部分权重。
+    relative_score = _clip((relative + 2) / 8 * 15, 0, 15)
 
-    # 动量: 短线(5日)15分 + 长线(20日)5分 = 20 分（短线优先捕捉主线切换）
-    r5_score = _clip((r5 + 3) / 13 * 15, 0, 15)
-    if r20 > 30:
-        r20_score = _clip(5 - (r20 - 30) * 0.15, 0, 5)
+    # 成交质量 10 分。温和放量最好，极端天量不再继续加分，避免高潮日追涨。
+    if amount_ratio <= 0.7:
+        volume_score = 0.0
+    elif amount_ratio <= 1.8:
+        volume_score = _clip((amount_ratio - 0.7) / 1.1 * 10, 0, 10)
+    elif amount_ratio <= 3.0:
+        volume_score = 10.0
     else:
-        r20_score = _clip((r20 + 5) / 25 * 5, 0, 5)
+        volume_score = _clip(10 - (amount_ratio - 3.0) * 2, 3, 10)
+
+    # 动量 25 分：5日负责切换速度，20日负责趋势持续性；极端动量递减。
+    r5_score = _clip((r5 + 3) / 13 * 15, 0, 15)
+    if r5 > 12:
+        r5_score = _clip(15 - (r5 - 12) * 0.5, 4, 15)
+    if r20 > 30:
+        r20_score = _clip(10 - (r20 - 30) * 0.25, 2, 10)
+    else:
+        r20_score = _clip((r20 + 5) / 30 * 10, 0, 10)
     momentum_score = r5_score + r20_score
 
     # 反弹识别：5日强但20日弱 → 大概率只是脉冲，不是主线
@@ -658,8 +699,13 @@ def calc_auto_score(
     if "加速见顶" in stage or "加速期⚠" in stage:
         extension_penalty = min(extension_penalty, 0.6)
 
-    # 连续强于指数: 10 分（核心主线信号）
-    trend_score = min(10.0, consecutive_strong * 1.2)
+    # 趋势质量 15 分：连续相对强势 + 5/20日同向，区分持续主线和单日脉冲。
+    trend_score = min(10.0, consecutive_strong * 1.5)
+    if r5 > 0 and r20 > 0:
+        trend_score += 3.0
+    if r5 > 3 and r20 > 5 and accel_5d >= -2:
+        trend_score += 2.0
+    trend_score = min(15.0, trend_score)
 
     # 流动性: 5 分
     if amount_yi >= 5:
@@ -671,18 +717,19 @@ def calc_auto_score(
     else:
         liquidity_score = 0
 
-    # 主力资金流: 10 分（同花顺增强）
+    # 主力资金流 15 分（独立于价格动量，是短线执行的重要确认）。
     extra = m.get("_hithink_extra") or {}
     main_flow_yi = extra.get("main_flow_yi")
-    flow_score, flow_note = calc_money_flow_score(main_flow_yi)
+    flow_score_raw, flow_note = calc_money_flow_score(main_flow_yi)
+    flow_score = flow_score_raw * 1.5
 
     catalyst_hints = {
-        "扩散期": 10,
-        "加速期": 4,
-        "确认期": 6,
-        "萌芽期": 4,
-        "观察期": 2,
-        "加速期⚠": 1,
+        "扩散期": 5,
+        "加速期": 3,
+        "确认期": 3,
+        "萌芽期": 2,
+        "观察期": 1,
+        "加速期⚠": 0,
         "加速见顶⚠": 0,
     }
     catalyst_score = catalyst_hints.get(stage, 0)
@@ -693,7 +740,16 @@ def calc_auto_score(
     hot_cat = m.get("_etf_category", "")
     sentiment_bonus = calc_sentiment_bonus(hot_name, hot_cat, hot_keywords)
 
-    raw_total = relative_score + volume_score + momentum_score + trend_score + liquidity_score + flow_score + catalyst_score + sentiment_bonus
+    raw_total = (
+        relative_score
+        + volume_score
+        + momentum_score
+        + trend_score
+        + liquidity_score
+        + flow_score
+        + catalyst_score
+        + sentiment_bonus
+    )
     risk_factor, risk_note = premium_discount_factor(is_qdii=is_qdii, premium_pct=premium_pct)
     total = raw_total * risk_factor * bounce_penalty * extension_penalty
 
@@ -924,13 +980,16 @@ def _portfolio_rank_key(r: dict) -> tuple:
     )
 
 
-def _portfolio_exclusion_reason(r: dict) -> str | None:
+def _portfolio_exclusion_reason(r: dict, market_state: str = "未知") -> str | None:
     m = r.get("metrics", {})
     stage = r.get("stage", ("", "", ""))[0]
+    score = float(r.get("score", {}).get("total") or 0)
     if "error" in m:
         return str(m.get("error"))
     if stage not in NEW_MONEY_STAGES:
         return f"{stage}不适合作为新组合主仓"
+    if score < CORE_ENTRY_SCORE:
+        return f"评分{score:.1f}<{CORE_ENTRY_SCORE:.0f}分核心门槛"
     if r.get("category") in {"货币", "债券"}:
         return "现金/债券工具不进入进攻组合"
     if r.get("is_qdii"):
@@ -939,6 +998,15 @@ def _portfolio_exclusion_reason(r: dict) -> str | None:
         return f"成交额<{PORTFOLIO_MIN_AMOUNT_YI:.0f}亿，不作为主仓"
     if m.get("overheat") and float(m.get("pct_chg") or 0) >= 7:
         return "20日过热且单日高潮，不新开主仓"
+    trend_ok, trend_reason = new_position_trend_gate(
+        category=r.get("category", "其他"),
+        market_state=market_state,
+        score=score,
+        ret_20d=float(m.get("ret_20d") or 0),
+        ret_60d=float(m.get("ret_60d") or 0),
+    )
+    if not trend_ok:
+        return trend_reason
     return None
 
 
@@ -953,7 +1021,11 @@ def _better_theme_candidate(current: dict, challenger: dict) -> dict:
     return current
 
 
-def pick_formal_portfolio(candidates: list[dict], target_count: int = 3) -> tuple[list[dict], list[tuple[dict, str]]]:
+def pick_formal_portfolio(
+    candidates: list[dict],
+    target_count: int = 3,
+    market_state: str = "未知",
+) -> tuple[list[dict], list[tuple[dict, str]]]:
     """
     正式组合选择器。
     它比“强度排名”更严格：流动性、同主线集中度、宽基数量和过热新开都在这里统一处理。
@@ -961,7 +1033,7 @@ def pick_formal_portfolio(candidates: list[dict], target_count: int = 3) -> tupl
     excluded = []
     eligible = []
     for r in candidates:
-        reason = _portfolio_exclusion_reason(r)
+        reason = _portfolio_exclusion_reason(r, market_state)
         if reason:
             excluded.append((r, reason))
         else:
@@ -970,7 +1042,13 @@ def pick_formal_portfolio(candidates: list[dict], target_count: int = 3) -> tupl
     ordered = sorted(eligible, key=_portfolio_rank_key, reverse=True)
     selected = []
     industry_count: dict[str, int] = {}
+    cluster_count: dict[str, int] = {}
     broad_count = 0
+    cluster_limit = (
+        target_count
+        if market_state == "主升"
+        else MAX_SAME_RISK_CLUSTER
+    )
 
     for r in ordered:
         ind = r.get("industry", "其他")
@@ -999,6 +1077,9 @@ def pick_formal_portfolio(candidates: list[dict], target_count: int = 3) -> tupl
                 continue
         elif industry_count.get(ind, 0) >= PORTFOLIO_MAX_SAME_INDUSTRY:
             continue
+        cluster = risk_cluster(r.get("category", "其他"), ind, r.get("etf_name", ""))
+        if cluster_count.get(cluster, 0) >= cluster_limit:
+            continue
 
         # 若同一行业已有泛主题，且新候选分数接近但更具体，替换泛主题。
         replaced = False
@@ -1020,7 +1101,52 @@ def pick_formal_portfolio(candidates: list[dict], target_count: int = 3) -> tupl
         if ind == "宽基":
             broad_count += 1
         industry_count[ind] = industry_count.get(ind, 0) + 1
+        cluster_count[cluster] = cluster_count.get(cluster, 0) + 1
 
+    # 强信号不足三只时仍只从固定池补位。补位拒绝低流动性、衰竭、
+    # 过热和默认无法核验折溢价的跨境品种。
+    if len(selected) < target_count:
+        blocked_stages = {"衰竭期", "衰弱期", "弱势期", "加速见顶⚠"}
+        selected_codes = {r.get("etf_code") for r in selected}
+        fallback = sorted(candidates, key=_portfolio_rank_key, reverse=True)
+        for r in fallback:
+            if len(selected) >= target_count:
+                break
+            if r.get("etf_code") in selected_codes:
+                continue
+            m = r.get("metrics", {})
+            ind = r.get("industry", "其他")
+            if "error" in m or r.get("category") == "货币":
+                continue
+            if float(r.get("score", {}).get("total") or 0) < FALLBACK_ENTRY_SCORE:
+                continue
+            if r.get("stage", ("", "", ""))[0] in blocked_stages:
+                continue
+            if r.get("is_qdii") or float(m.get("amount_yi") or 0) < PORTFOLIO_MIN_AMOUNT_YI:
+                continue
+            if m.get("overheat") and float(m.get("pct_chg") or 0) >= 7:
+                continue
+            if ind == "宽基" and broad_count >= PORTFOLIO_MAX_BROAD:
+                continue
+            if ind != "宽基" and industry_count.get(ind, 0) >= PORTFOLIO_MAX_SAME_INDUSTRY:
+                continue
+            cluster = risk_cluster(r.get("category", "其他"), ind, r.get("etf_name", ""))
+            if cluster_count.get(cluster, 0) >= cluster_limit:
+                continue
+            r = {**r, "portfolio_tier": "补位"}
+            selected.append(r)
+            selected_codes.add(r.get("etf_code"))
+            if ind == "宽基":
+                broad_count += 1
+            industry_count[ind] = industry_count.get(ind, 0) + 1
+            cluster_count[cluster] = cluster_count.get(cluster, 0) + 1
+
+    selected_codes = {r.get("etf_code") for r in selected}
+    excluded = [
+        (r, reason)
+        for r, reason in excluded
+        if r.get("etf_code") not in selected_codes
+    ]
     return selected, excluded
 
 
@@ -1154,7 +1280,7 @@ def generate_report(results: list, market_env: dict, bench_pct: float, target_da
     # 汇总
     lines.append("### 组合建议")
     lines.append("")
-    candidate_picks = sorted(
+    strong_picks = sorted(
         [
             r for r in actionable
             if r["stage"][0] in NEW_MONEY_STAGES and r["category"] != "货币"
@@ -1162,35 +1288,53 @@ def generate_report(results: list, market_env: dict, bench_pct: float, target_da
         key=_rank_key,
         reverse=True,
     )
-    raw_picks = candidate_picks[:5]
-    picks = _pick_diversified(candidate_picks, target_count=3)
-    formal_picks, formal_excluded = pick_formal_portfolio(candidate_picks, target_count=3)
+    pool_candidates = sorted(
+        [r for r in actionable if r["category"] != "货币"],
+        key=_rank_key,
+        reverse=True,
+    )
+    raw_picks = strong_picks[:5]
+    picks = _pick_diversified(strong_picks, target_count=3)
+    market_state = market_env.get("market_state", "未知")
+    formal_picks, formal_excluded = pick_formal_portfolio(
+        pool_candidates,
+        target_count=3,
+        market_state=market_state,
+    )
 
-    if raw_picks:
-        lines.append("原始强度前三（诊断参考，非执行组合）：")
+    if formal_picks:
+        if raw_picks:
+            lines.append("原始强度前三（诊断参考，非执行组合）：")
+            lines.append("")
+            lines.append("| 排名 | 方向 | 类型 | 行业 | 阶段 | 评分 | ETF/LOF |")
+            lines.append("|---:|---|---|---|---|---:|---|")
+            for i, r in enumerate(raw_picks[:3], 1):
+                product_note = r.get("product_type", "ETF")
+                if r.get("is_qdii"):
+                    product_note = f"{product_note}/QDII"
+                lines.append(
+                    f"| {i} | {r['direction']} | {product_note} | {r['industry']} | {r['stage'][0]} | {r['score']['total']:.1f} | {r['etf_name']} `{r['etf_code']}` |"
+                )
+            lines.append("")
+        lines.append("正式池内候选（唯一方向口径，仍需完成催化、买点和盈亏比检查）：")
         lines.append("")
-        lines.append("| 排名 | 方向 | 类型 | 行业 | 阶段 | 评分 | ETF/LOF |")
-        lines.append("|---:|---|---|---|---|---:|---|")
-        for i, r in enumerate(raw_picks[:3], 1):
-            product_note = r.get("product_type", "ETF")
-            if r.get("is_qdii"):
-                product_note = f"{product_note}/QDII"
-            lines.append(
-                f"| {i} | {r['direction']} | {product_note} | {r['industry']} | {r['stage'][0]} | {r['score']['total']:.1f} | {r['etf_name']} `{r['etf_code']}` |"
-            )
-        lines.append("")
-        lines.append("正式组合候选（唯一执行口径，执行硬门禁后）：")
-        lines.append("")
-        lines.append("| 优先级 | 方向 | 类型 | 行业 | 阶段 | 评分 | 建议仓位 | ETF或候选标的 |")
-        lines.append("|---:|---|---|---|---|---:|---|---|")
+        lines.append("| 优先级 | 方向 | 类型 | 行业 | 阶段 | 评分 | 层级 | 建议仓位 | 池内标的 |")
+        lines.append("|---:|---|---|---|---|---:|---|---:|---|")
+        formal_weights = allocate_ranked_weights(market_state, len(formal_picks[:3]))
         for i, r in enumerate(formal_picks[:3], 1):
             product_note = r.get("product_type", "ETF")
             if r.get("is_qdii"):
                 product_note = f"{product_note}/QDII"
             lines.append(
-                f"| {i} | {r['direction']} | {product_note} | {r['industry']} | {r['stage'][0]} | {r['score']['total']:.1f} | 20% "
+                f"| {i} | {r['direction']} | {product_note} | {r['industry']} | {r['stage'][0]} | {r['score']['total']:.1f} "
+                f"| {r.get('portfolio_tier', '核心')} | {formal_weights[i - 1]:g}% "
                 f"| {r['etf_name']} `{r['etf_code']}` |"
             )
+        cash_weight = round(100 - sum(formal_weights), 1)
+        lines.append(f"| — | 现金 | 现金 | — | — | — | — | {cash_weight:g}% | — |")
+        if len(formal_picks) < 3:
+            lines.append("")
+            lines.append("> 候选不足3只，本表仅为观察草稿，不得生成正式预测。")
         if formal_excluded:
             shown = 0
             lines.append("")
@@ -1205,7 +1349,7 @@ def generate_report(results: list, market_env: dict, bench_pct: float, target_da
         lines.append("")
         lines.append("去相关组合参考（诊断参考，非执行组合）：")
         lines.append("")
-        lines.append("| 优先级 | 方向 | 类型 | 行业 | 阶段 | 评分 | 建议仓位 | ETF或候选标的 |")
+        lines.append("| 优先级 | 方向 | 类型 | 行业 | 阶段 | 评分 | 建议仓位 | 池内标的 |")
         lines.append("|---:|---|---|---|---|---:|---|---|")
         for i, r in enumerate(picks[:3], 1):
             product_note = r.get("product_type", "ETF")
@@ -1216,9 +1360,9 @@ def generate_report(results: list, market_env: dict, bench_pct: float, target_da
                 f"| {r['etf_name']} `{r['etf_code']}` |"
             )
         lines.append("")
-        lines.append("> 原始强度和去相关组合只用于解释资金主线；每日正式 selection 只能从“正式组合候选”继续做催化、买点、ETF/LOF 折溢价风险和盈亏比检查。")
+        lines.append("> 原始强度和去相关组合只用于解释资金主线；周度正式 selection 只能从“正式池内候选”继续做催化、买点、折溢价风险和盈亏比检查。")
     else:
-        lines.append("> 当前无扩散期或确认期方向，建议以现金为主或仅保留试探仓")
+        lines.append("> 固定池没有可用行情候选，本报告仅为数据异常草稿，不得生成正式预测。")
 
     return "\n".join(lines)
 
@@ -1413,6 +1557,12 @@ def main():
             "amount_yi": m.get("amount_yi"),
             "pct": m.get("pct_chg"),
             "close": m.get("close"),
+            "ret_5d": m.get("ret_5d"),
+            "ret_20d": m.get("ret_20d"),
+            "ret_60d": m.get("ret_60d"),
+            "amount_ratio": m.get("amount_ratio"),
+            "industry": r.get("industry"),
+            "direction": r.get("direction"),
             "is_qdii": r.get("is_qdii", False),
         })
     scan_rows.sort(key=lambda x: -(x["score"] or 0))

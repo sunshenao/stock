@@ -1,0 +1,6 @@
+known_at,event_type,scope,score,horizon_days,source,url,summary
+2026-07-24T20:04:57,macro,global,-0.70,5,第一财经,https://www.yicai.com/news/103291576.html,海外风险发酵且美债收益率油价上行美股科技权重下跌
+2026-07-24T15:30:00,industry,高弹性成长,0.35,5,每日经济新闻,https://www.nbd.com.cn/articles/2026-07-24/4511356.html,英特尔指引和SEMI数据继续验证半导体设备景气
+2026-07-24T20:04:57,commodity,资源商品,0.30,5,第一财经,https://www.yicai.com/news/103291576.html,国际油价上行强化能源链价格弹性同时抬升通胀风险
+2026-07-25T18:00:00,scheduled_data,资源商品,0.15,3,USDA NASS,https://esmis.nal.usda.gov/publication/crop-progress,美国农业部将于7月27日发布作物生长进度报告用于验证大豆天气交易
+2026-07-25T18:00:00,scheduled_data,资源商品,0.10,3,US EIA,https://www.eia.gov/petroleum/supply/weekly/,美国能源信息署将于7月29日发布周度石油库存报告用于验证油价供需

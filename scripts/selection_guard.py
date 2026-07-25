@@ -10,19 +10,24 @@ import argparse
 import re
 import sys
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from risk_rules import (  # noqa: E402
-    is_defensive_state,
+    TARGET_SELECTION_COUNT,
+    get_position_cap,
     requires_aggressive_deployment,
+    risk_cluster,
     single_position_cap,
 )
+from etf_analyzer import load_etf_txt  # noqa: E402
 
 
 MARKET_STATES = ("主升", "震荡", "退潮", "退潮末期", "冰点", "未知")
+FORMAL_FREQUENCY = "周度"
 MAIN_POSITION_MIN = 20
 CONSERVATIVE_POSITION_CAP = 15
 PROBE_POSITION_CAP = 10
@@ -33,6 +38,7 @@ RETREAT_SINGLE_DAY_NO_CATALYST_LIMIT = 5.0
 RETREAT_RET20_NEW_POSITION_LIMIT = 15.0
 RETREAT_RET20_HOLD_ONLY_LIMIT = 25.0
 RETREAT_RET20_HIGH_RISK_LIMIT = 35.0
+WEEKLY_ALLOWED_WEEKDAYS = {0, 4, 5, 6}  # 周一盘前，或周五至周末
 
 
 @dataclass(frozen=True)
@@ -51,13 +57,6 @@ class Holding:
     def code(self) -> str | None:
         match = re.search(r"`?(\d{6})`?", self.instrument)
         return match.group(1) if match else None
-
-    @property
-    def is_stock(self) -> bool:
-        code = self.code
-        if not code:
-            return False
-        return code.startswith(("0", "3", "6"))
 
     @property
     def is_etf_like(self) -> bool:
@@ -82,6 +81,11 @@ def _extract_market_state(text: str) -> str | None:
         if f"市场状态 | **{state}**" in text:
             return state
     return None
+
+
+def _extract_frequency(text: str) -> str | None:
+    match = re.search(r"(?:调仓频率|决策频率|推荐频率)\s*[：:|]\s*\*{0,2}(日度|周度|月度)\*{0,2}", text)
+    return match.group(1) if match else None
 
 
 def _cash_range_from_line(line: str) -> tuple[float, float] | None:
@@ -270,18 +274,6 @@ def _extract_holding_context(text: str, holding: "Holding") -> str:
     return "\n".join(parts) if parts else holding.row_text
 
 
-def _extract_expert_consensus(context: str) -> float | None:
-    patterns = [
-        r"专家共识\s*(\d+(?:\.\d+)?)",
-        r"共识\s*(?:均分)?\s*[:：]?\s*(\d+(?:\.\d+)?)\s*/?100?",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, context)
-        if match:
-            return float(match.group(1))
-    return None
-
-
 def _has_unknown_qdii_premium(context: str) -> bool:
     return "溢价未知" in context or ("溢价" not in context and "折溢价" not in context)
 
@@ -411,28 +403,52 @@ def _extract_single_day_change(context: str) -> float | None:
     return None
 
 
-def _validate_holdings(text: str, market_state: str | None, errors: list[str]) -> None:
+def _validate_holdings(
+    text: str,
+    market_state: str | None,
+    allowed_codes: set[str],
+    errors: list[str],
+) -> None:
     holdings = _extract_portfolio_holdings(text)
     if not holdings:
         errors.append("未找到最终组合表（需包含 标的 + 计划/最终/目标/建议仓位 列）")
         return
 
     active_holdings = [holding for holding in holdings if not holding.is_cash and holding.position_high > 0]
+    active_codes = [holding.code for holding in active_holdings if holding.code]
+    if len(active_codes) != len(active_holdings):
+        errors.append("正式组合每个标的都必须写出 scripts/etf.txt 中的六位代码")
+    if len(set(active_codes)) != len(active_codes):
+        errors.append("正式组合的三个标的代码必须互不相同")
+    for holding in active_holdings:
+        if holding.code and holding.code not in allowed_codes:
+            errors.append(
+                f"{holding.instrument} 不在 scripts/etf.txt 固定池中，禁止进入正式预测"
+            )
     if market_state:
-        if requires_aggressive_deployment(market_state):
-            if not (1 <= len(active_holdings) <= 3):
-                errors.append(
-                    f"非防守市场({market_state})必须有 1-3 个非现金标的，当前为 {len(active_holdings)} 个"
-                )
-        elif is_defensive_state(market_state):
-            if len(active_holdings) > 3:
-                errors.append(
-                    f"防守市场({market_state})非现金标的不得超过 3 个，当前为 {len(active_holdings)} 个"
-                )
+        if len(active_holdings) != TARGET_SELECTION_COUNT:
+            errors.append(
+                f"{market_state}正式组合必须有 {TARGET_SELECTION_COUNT} 个非现金标的，"
+                f"当前为 {len(active_holdings)} 个"
+            )
+
+        exposure_low = sum(holding.position_low for holding in active_holdings)
+        exposure_high = sum(holding.position_high for holding in active_holdings)
+        cap = get_position_cap(market_state)
+        if exposure_low < cap.low or exposure_high > cap.high:
+            errors.append(
+                f"{market_state}总仓位应在 {cap.text}，当前为 "
+                f"{exposure_low:g}-{exposure_high:g}%"
+            )
+
+        if len(active_holdings) == TARGET_SELECTION_COUNT:
+            weights = {round(holding.position_high, 2) for holding in active_holdings}
+            if len(weights) != TARGET_SELECTION_COUNT:
+                errors.append("三只标的必须按强弱设置不同仓位，不能机械等权")
 
     direction_exposure: dict[str, float] = {}
     for holding in active_holdings:
-        cap = single_position_cap("stock" if holding.is_stock else "etf", holding.is_qdii_like)
+        cap = single_position_cap("etf", holding.is_qdii_like)
         if holding.position_high > cap:
             errors.append(f"{holding.instrument} 仓位 {holding.position_high:g}% 超过单标的上限 {cap}%")
 
@@ -440,12 +456,15 @@ def _validate_holdings(text: str, market_state: str | None, errors: list[str]) -
             direction_exposure[holding.direction] = direction_exposure.get(holding.direction, 0) + holding.position_high
 
         context = _extract_holding_context(text, holding)
-        if holding.is_stock and holding.position_high > CONSERVATIVE_POSITION_CAP:
-            consensus = _extract_expert_consensus(context)
-            if consensus is None:
-                errors.append(f"股票 {holding.instrument} 仓位 >15%，但未找到专家共识分")
-            elif consensus < 40:
-                errors.append(f"股票 {holding.instrument} 专家共识 {consensus:g}<40，仓位不得超过15%")
+        if (
+            holding.position_high > PROBE_POSITION_CAP
+            and not _is_existing_or_hold_only(context)
+            and not _has_clear_catalyst(context)
+        ):
+            errors.append(
+                f"{holding.instrument} 仓位 >{PROBE_POSITION_CAP:g}%，"
+                "但未找到明确催化或待发生事件"
+            )
 
         if holding.is_qdii_like and holding.position_high > CONSERVATIVE_POSITION_CAP:
             context = context or holding.row_text
@@ -517,6 +536,45 @@ def _validate_holdings(text: str, market_state: str | None, errors: list[str]) -
 def validate_selection(path: Path) -> tuple[bool, list[str]]:
     text = path.read_text(encoding="utf-8-sig")
     errors = []
+    allowed_codes = {cfg["code"] for cfg in load_etf_txt().values()}
+    if not allowed_codes:
+        errors.append("scripts/etf.txt 为空或读取失败，禁止生成正式预测")
+
+    frequency = _extract_frequency(text)
+    if frequency != FORMAL_FREQUENCY:
+        shown = frequency or "未填写"
+        errors.append(
+            f"正式 selection 只允许周度调仓，当前频率为 {shown}；"
+            "日度只能写 risk_review.md，月度只能写 monthly_review.md"
+        )
+
+    try:
+        plan_date = datetime.strptime(path.parent.name, "%Y-%m-%d")
+    except (TypeError, ValueError):
+        plan_date = None
+    if plan_date is not None and plan_date.weekday() not in WEEKLY_ALLOWED_WEEKDAYS:
+        if "节假日特殊调仓：是" not in text:
+            errors.append(
+                "正式周度方案只能在周五至周末生成或周一盘前执行；"
+                "节假日导致的周中方案必须明确写“节假日特殊调仓：是”"
+            )
+
+    if not re.search(r"数据截止时间\s*[：:]\s*\S+", text):
+        errors.append("周度方案缺少“数据截止时间”，无法验证时点")
+    if not re.search(r"下次常规重排\s*[：:]\s*\S+", text):
+        errors.append("周度方案缺少“下次常规重排”，无法锁定周度频率")
+    if "国际事件复核" not in text:
+        errors.append("周度方案缺少“国际事件复核”")
+    if not re.search(r"新闻截止时间\s*[：:]\s*\S+", text):
+        errors.append("国际事件复核缺少“新闻截止时间”")
+    event_risk_match = re.search(
+        r"国际事件风险\s*[：:]\s*\*{0,2}(正常|黄色|红色)",
+        text,
+    )
+    if not event_risk_match:
+        errors.append("国际事件复核缺少标准风险结论：正常/黄色/红色")
+    if not re.search(r"国际事件动作\s*[：:]\s*\S+", text):
+        errors.append("国际事件复核缺少“国际事件动作”，无法确认新闻是否实际影响组合")
 
     market_state = _extract_market_state(text)
     if not market_state:
@@ -528,12 +586,38 @@ def validate_selection(path: Path) -> tuple[bool, list[str]]:
 
     if market_state and cash_range:
         cash_low, cash_high = cash_range
-        if requires_aggressive_deployment(market_state) and cash_high > 5:
+        if requires_aggressive_deployment(market_state) and cash_high > 40:
             errors.append(
-                f"{market_state}要求满仓(现金≤5%)，当前现金区间为{cash_low:g}-{cash_high:g}%"
+                f"{market_state}要求现金≤40%，当前现金区间为{cash_low:g}-{cash_high:g}%"
             )
 
-    _validate_holdings(text, market_state, errors)
+        holdings = _extract_portfolio_holdings(text)
+        active = [holding for holding in holdings if not holding.is_cash]
+        invested_low = sum(holding.position_low for holding in active)
+        invested_high = sum(holding.position_high for holding in active)
+        total_low = invested_low + cash_low
+        total_high = invested_high + cash_high
+        if total_low < 99.5 or total_high > 100.5:
+            errors.append(
+                f"组合仓位与现金之和必须为100%，当前为{total_low:g}-{total_high:g}%"
+            )
+
+    _validate_holdings(text, market_state, allowed_codes, errors)
+
+    if event_risk_match and event_risk_match.group(1) == "红色":
+        for holding in _extract_portfolio_holdings(text):
+            if holding.is_cash or holding.position_high <= 0:
+                continue
+            context = _extract_holding_context(text, holding)
+            cluster = risk_cluster(
+                holding.direction,
+                holding.direction,
+                holding.instrument,
+            )
+            if cluster == "高弹性成长" and not _is_existing_or_hold_only(context):
+                errors.append(
+                    f"全球事件风险为红色，禁止新开高弹性仓位 {holding.instrument}"
+                )
 
     return not errors, errors
 

@@ -3,3 +3,7 @@ __pycache__/
 *$py.class
 
 etf_raw.json
+breadth.json
+etf_rank_p*.json
+codex/stock/.cache/
+.claude/settings.local.json
