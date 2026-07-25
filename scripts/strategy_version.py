@@ -16,6 +16,7 @@ STRATEGY_FILES = (
     "scripts/daily_risk.py",
     "scripts/execution_model.py",
     "scripts/event_risk.py",
+    "scripts/market_data_cache.py",
     "scripts/etf_analyzer.py",
     "scripts/backtest.py",
     "scripts/backtest_current.py",

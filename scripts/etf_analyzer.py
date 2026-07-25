@@ -37,6 +37,7 @@ from risk_rules import (
     risk_cluster,
 )
 from market_state import classify_market_state
+from market_data_cache import adjust_price_discontinuities, load_history
 from skill_paths import find_hithink_cli, find_skill_scripts
 
 # Stock-analyzer-skill 路径（兼容 .claude/.codex/npm 全局安装）
@@ -173,7 +174,7 @@ def load_etf_txt(path: Path = ETF_TXT_PATH) -> OrderedDict:
     return etfs
 
 
-def get_market_environment() -> dict:
+def get_market_environment(*, offline: bool = False) -> dict:
     """获取市场宽度数据，判断市场状态，给出仓位上限建议"""
     fallback_state = "未知"
     try:
@@ -192,6 +193,7 @@ def get_market_environment() -> dict:
             start.strftime("%Y%m%d"),
             end.strftime("%Y%m%d"),
             "ETF",
+            offline=offline,
         )
         closes = benchmark.sort_values("date")["close"].astype(float).tail(20).tolist()
         benchmark_pct = (
@@ -222,7 +224,7 @@ def get_market_environment() -> dict:
     }
 
 
-def get_replay_market_environment(target_date: str) -> dict:
+def get_replay_market_environment(target_date: str, *, offline: bool = False) -> dict:
     """历史复盘禁止引用当前实时市场宽度，避免未来数据污染。"""
     target = pd.to_datetime(target_date)
     state = "未知"
@@ -232,6 +234,7 @@ def get_replay_market_environment(target_date: str) -> dict:
             (target - timedelta(days=45)).strftime("%Y%m%d"),
             target.strftime("%Y%m%d"),
             "ETF",
+            offline=offline,
         )
         closes = benchmark.sort_values("date")["close"].astype(float).tail(20).tolist()
         benchmark_pct = (
@@ -453,27 +456,18 @@ def _adjust_price_discontinuities(df: pd.DataFrame) -> pd.DataFrame:
     新浪等免费源有时返回不复权价格，例如前一日收盘 3.x、次日开盘 1.x。
     这种跳变不是投资亏损，若直接回测会制造虚假的 -60% 月收益。
     """
-    if df.empty or "close" not in df.columns:
-        return df
-    df = df.sort_values("date").reset_index(drop=True).copy()
-    price_cols = [c for c in ("open", "high", "low", "close") if c in df.columns]
-    for col in price_cols:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    for i in range(1, len(df)):
-        prev_close = df.at[i - 1, "close"]
-        today_ref = df.at[i, "open"] if "open" in df.columns else df.at[i, "close"]
-        if pd.isna(prev_close) or pd.isna(today_ref) or prev_close <= 0:
-            continue
-        ratio = today_ref / prev_close
-        if ratio < 0.65 or ratio > 1.55:
-            df.loc[: i - 1, price_cols] = df.loc[: i - 1, price_cols] * ratio
-
-    df["pct_chg"] = df["close"].pct_change().fillna(0) * 100
-    return df
+    result = adjust_price_discontinuities(df)
+    if not result.empty:
+        result["pct_chg"] = result["close"].pct_change().fillna(0) * 100
+    return result
 
 
-def fetch_etf_hist(code: str, start: str, end: str, product_type: str = "ETF") -> pd.DataFrame:
+def _fetch_etf_hist_network(
+    code: str,
+    start: str,
+    end: str,
+    product_type: str = "ETF",
+) -> pd.DataFrame:
     """获取 ETF 历史日线。优先用东方财富，失败时回退新浪。"""
     # 1. 先试东方财富
     try:
@@ -483,11 +477,15 @@ def fetch_etf_hist(code: str, start: str, end: str, product_type: str = "ETF") -
             col_map = {
                 "日期": "date", "开盘": "open", "收盘": "close",
                 "最高": "high", "最低": "low", "成交量": "volume",
-                "成交额": "amount", "涨跌幅": "pct_chg",
+                "成交额": "amount", "振幅": "amplitude_provider",
+                "涨跌幅": "pct_chg_provider", "涨跌额": "change_provider",
+                "换手率": "turnover_rate",
             }
             df = df.rename(columns=col_map)
             df["date"] = pd.to_datetime(df["date"])
-            return _adjust_price_discontinuities(df)
+            result = _adjust_price_discontinuities(df)
+            result.attrs["data_source"] = "eastmoney"
+            return result
     except Exception:
         pass
 
@@ -497,17 +495,48 @@ def fetch_etf_hist(code: str, start: str, end: str, product_type: str = "ETF") -
         df = ak.fund_etf_hist_sina(symbol=f"{prefix}{code}")
         if len(df) > 0:
             col_map = {"date": "date", "open": "open", "high": "high",
-                       "low": "low", "close": "close", "volume": "volume", "amount": "amount"}
+                       "low": "low", "close": "close", "volume": "volume",
+                       "amount": "amount", "postVol": "after_hours_volume",
+                       "postAmt": "after_hours_amount"}
             df = df.rename(columns=col_map)
             df["date"] = pd.to_datetime(df["date"])
+            provider_min_date = df["date"].min()
             # 新浪不直接给涨跌幅，后续 calc_etf_metrics 会自己算
-            return _adjust_price_discontinuities(df)
+            requested_start = pd.to_datetime(start)
+            requested_end = pd.to_datetime(end)
+            df = df[(df["date"] >= requested_start) & (df["date"] <= requested_end)]
+            result = _adjust_price_discontinuities(df)
+            result.attrs["data_source"] = "sina"
+            result.attrs["history_complete_left"] = True
+            result.attrs["provider_min_date"] = provider_min_date.strftime("%Y-%m-%d")
+            return result
     except Exception:
         pass
 
     empty = pd.DataFrame()
     empty.attrs["fetch_error"] = "东方财富和新浪均不可用"
     return empty
+
+
+def fetch_etf_hist(
+    code: str,
+    start: str,
+    end: str,
+    product_type: str = "ETF",
+    *,
+    refresh_cache: bool = False,
+    offline: bool = False,
+) -> pd.DataFrame:
+    """Load ETF history locally first and fetch only missing date edges."""
+    return load_history(
+        code,
+        start,
+        end,
+        product_type,
+        network_fetcher=_fetch_etf_hist_network,
+        refresh=refresh_cache,
+        offline=offline,
+    )
 
 
 def calc_etf_metrics(df: pd.DataFrame, target_date: str) -> dict:
@@ -1423,6 +1452,8 @@ def main():
     parser.add_argument("--top", type=int, default=30, help="输出前 N 名 (默认30)")
     parser.add_argument("--workers", type=int, default=8, help="并发抓取 ETF 行情的线程数 (默认8)")
     parser.add_argument("--hithink", action="store_true", help="启用同花顺资金增强（AKShare 不可用时强制回退）")
+    parser.add_argument("--offline", action="store_true", help="只使用本地行情，禁止网络回退")
+    parser.add_argument("--refresh-cache", action="store_true", help="强制刷新请求区间并合并到本地缓存")
     args = parser.parse_args()
 
     target_date = args.date or datetime.now().strftime("%Y-%m-%d")
@@ -1439,9 +1470,9 @@ def main():
     # Layer 1: 市场环境
     print("Layer 1: 获取市场宽度...", file=sys.stderr)
     if target_ts == latest_realtime_ts:
-        market_env = get_market_environment()
+        market_env = get_market_environment(offline=args.offline)
     else:
-        market_env = get_replay_market_environment(target_date)
+        market_env = get_replay_market_environment(target_date, offline=args.offline)
         print("  历史复盘模式: 不使用实时市场宽度", file=sys.stderr)
     print(f"  状态={market_env['market_state']}, 涨跌比={market_env['up_ratio']}, 仓位上限={market_env['position_cap']}", file=sys.stderr)
 
@@ -1465,13 +1496,22 @@ def main():
         start_date,
         end_date,
         bench_cfg.get("type", "ETF"),
+        refresh_cache=args.refresh_cache,
+        offline=args.offline,
     ) if bench_cfg else pd.DataFrame()
     bench_m = calc_etf_metrics(bench_df, target_date)
     bench_pct = bench_m.get("pct_chg", 0.0)
 
     def analyze_one(item: tuple[str, dict]) -> dict:
         direction, cfg = item
-        df = fetch_etf_hist(cfg["code"], start_date, end_date, cfg.get("type", "ETF"))
+        df = fetch_etf_hist(
+            cfg["code"],
+            start_date,
+            end_date,
+            cfg.get("type", "ETF"),
+            refresh_cache=args.refresh_cache,
+            offline=args.offline,
+        )
         metrics = calc_etf_metrics(df, target_date)
         strong_days = calc_consecutive_strong(df, bench_df, target_date)
         stage = classify_stage(metrics, strong_days)

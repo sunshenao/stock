@@ -68,7 +68,6 @@ COMMODITY_PARABOLIC_R20 = 80.0
 COMMODITY_PARABOLIC_R60 = 150.0
 ONE_WAY_COST_BPS = 8.0
 STOP_SLIPPAGE_BPS = 10.0
-HISTORY_CACHE_DIR = PROJECT_ROOT / "codex" / "stock" / ".cache" / "etf_history"
 # 追高硬门禁：符合任一条件时该腿仅按试探仓 10% 建仓
 # 只在防守市场（退潮/退潮末期/冰点）触发；主升/震荡下真趋势不做机械稀释。
 CHASE_5D_RETURN_LIMIT = 25.0
@@ -865,23 +864,26 @@ def _fetch_hist_cached(
     end_date: str,
     product_type: str,
     refresh_cache: bool = False,
+    offline: bool = False,
 ) -> pd.DataFrame:
-    """按精确回测区间缓存行情，避免重复下载污染运行时间和可复现性。"""
-    product = str(product_type or "ETF").upper()
-    cache_path = HISTORY_CACHE_DIR / f"{code}_{product}_{start_date}_{end_date}.csv"
-    if cache_path.exists() and not refresh_cache:
-        try:
-            cached = pd.read_csv(cache_path, parse_dates=["date"])
-            if not cached.empty:
-                return cached
-        except (OSError, ValueError, pd.errors.ParserError):
-            pass
-
-    df = fetch_etf_hist(code, start_date, end_date, product)
-    if not df.empty:
-        HISTORY_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        df.to_csv(cache_path, index=False, encoding="utf-8")
-    return df
+    """Use the shared per-instrument cache for every backtest request."""
+    frame = fetch_etf_hist(
+        code,
+        start_date,
+        end_date,
+        str(product_type or "ETF").upper(),
+        refresh_cache=refresh_cache,
+        offline=offline,
+    )
+    if offline and (
+        not frame.attrs.get("coverage_start_ok", False)
+        or not frame.attrs.get("coverage_end_ok", False)
+    ):
+        raise RuntimeError(
+            f"offline cache coverage incomplete for {code}: "
+            f"{start_date}..{end_date}"
+        )
+    return frame
 
 
 def fetch_all_hist(
@@ -889,6 +891,7 @@ def fetch_all_hist(
     start_date: str,
     end_date: str,
     refresh_cache: bool = False,
+    offline: bool = False,
 ) -> dict[str, pd.DataFrame]:
     data = {}
     total = len(etf_pool)
@@ -901,6 +904,7 @@ def fetch_all_hist(
                 end_date,
                 cfg.get("type", "ETF"),
                 refresh_cache,
+                offline,
             ): cfg["code"]
             for cfg in etf_pool.values()
         }
@@ -915,6 +919,16 @@ def fetch_all_hist(
                 data[code] = df
             if i % 20 == 0 or i == total:
                 print(f"  行情已获取 {i}/{total}", flush=True)
+    if offline:
+        expected_codes = {cfg["code"] for cfg in etf_pool.values()}
+        missing_codes = sorted(expected_codes - set(data))
+        if missing_codes:
+            preview = ", ".join(missing_codes[:10])
+            suffix = "..." if len(missing_codes) > 10 else ""
+            raise RuntimeError(
+                f"offline cache is incomplete for {len(missing_codes)} instruments: "
+                f"{preview}{suffix}"
+            )
     return data
 
 
@@ -989,6 +1003,7 @@ def run_backtest(
     max_etfs: int | None = None,
     freq: str = "monthly",
     refresh_cache: bool = False,
+    offline: bool = False,
     one_way_cost_bps: float = ONE_WAY_COST_BPS,
     stop_slippage_bps: float = STOP_SLIPPAGE_BPS,
 ) -> pd.DataFrame:
@@ -1020,11 +1035,18 @@ def run_backtest(
         fetch_end,
         bench_cfg.get("type", "ETF"),
         refresh_cache,
+        offline,
     )
     if bench_df.empty:
         raise RuntimeError("沪深300ETF 基准行情获取失败")
 
-    data = fetch_all_hist(etf_pool, fetch_start, fetch_end, refresh_cache)
+    data = fetch_all_hist(
+        etf_pool,
+        fetch_start,
+        fetch_end,
+        refresh_cache,
+        offline,
+    )
     cluster_alerts = cluster_crash_calendar(etf_pool, data, start_dt, end_dt)
     universe_registry = load_registry()
     universe_status = registry_quality(universe_registry)
@@ -1512,6 +1534,7 @@ def run_backtest(
     df.attrs["weekly_max_broad"] = WEEKLY_MAX_BROAD if freq == "weekly" else None
     df.attrs["one_way_cost_bps"] = float(one_way_cost_bps)
     df.attrs["stop_slippage_bps"] = float(stop_slippage_bps)
+    df.attrs["offline"] = bool(offline)
     df.attrs["daily_equity"] = daily_equity
     df.attrs["positions"] = pd.DataFrame(position_records)
     df.attrs["trades"] = pd.DataFrame(trade_records).sort_values(
@@ -1648,6 +1671,7 @@ def write_report(
             "frequency": freq,
             "top_n": top_n,
             "minimum_amount_yi": min_amount_yi,
+            "offline": bool(df.attrs.get("offline", False)),
             "one_way_cost_bps": active_cost_bps,
             "stop_slippage_bps": active_slippage_bps,
         },
@@ -1849,6 +1873,7 @@ def main():
     parser.add_argument("--freq", choices=["monthly", "weekly"], default="weekly", help="调仓频率")
     parser.add_argument("--output", help="报告输出路径；默认写入周度/月度标准报告")
     parser.add_argument("--refresh-cache", action="store_true", help="忽略本地行情缓存并重新下载")
+    parser.add_argument("--offline", action="store_true", help="只从本地缓存读取行情，禁止网络回退")
     parser.add_argument("--cost-bps", type=float, default=ONE_WAY_COST_BPS, help="单边交易成本，bp")
     parser.add_argument(
         "--stop-slippage-bps",
@@ -1866,6 +1891,7 @@ def main():
         max_etfs=args.max_etfs,
         freq=args.freq,
         refresh_cache=args.refresh_cache,
+        offline=args.offline,
         one_way_cost_bps=args.cost_bps,
         stop_slippage_bps=args.stop_slippage_bps,
     )

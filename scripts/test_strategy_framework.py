@@ -6,6 +6,7 @@ import tempfile
 import unittest
 import json
 from pathlib import Path
+from unittest.mock import patch
 
 import pandas as pd
 
@@ -16,6 +17,7 @@ from backtest import (  # noqa: E402
     _calc_atr,
     _classify_loss_row,
     _cost_sensitivity,
+    _fetch_hist_cached,
     _finalize_daily_equity,
     _should_hold_position,
 )
@@ -24,6 +26,7 @@ from daily_risk import detect_cluster_crashes  # noqa: E402
 from etf_analyzer import pick_formal_portfolio  # noqa: E402
 from execution_model import simulate_long_with_stop  # noqa: E402
 from event_risk import Event, event_snapshot  # noqa: E402
+from market_data_cache import load_history, prepare_history  # noqa: E402
 from risk_rules import (  # noqa: E402
     CORE_ENTRY_SCORE,
     FALLBACK_ENTRY_SCORE,
@@ -591,6 +594,235 @@ class BacktestReportTests(unittest.TestCase):
         conclusion, responsibility = _classify_loss_row(row)
         self.assertEqual(conclusion, "市场下跌为主")
         self.assertIn("组合仍跑赢基准", responsibility)
+
+
+class MarketDataCacheTests(unittest.TestCase):
+    @staticmethod
+    def _bars(start: str, end: str) -> pd.DataFrame:
+        dates = pd.bdate_range(pd.to_datetime(start), pd.to_datetime(end))
+        sequence = pd.Series(range(len(dates)), dtype=float)
+        close = 1.0 + sequence * 0.01
+        return pd.DataFrame({
+            "date": dates,
+            "open": close - 0.005,
+            "high": close + 0.01,
+            "low": close - 0.01,
+            "close": close,
+            "volume": 1_000_000 + sequence * 1_000,
+            "amount": 10_000_000 + sequence * 10_000,
+            "turnover_rate": 1.0 + sequence * 0.01,
+        })
+
+    def test_second_read_is_local_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            calls = []
+
+            def fetcher(code: str, start: str, end: str, product: str) -> pd.DataFrame:
+                calls.append((code, start, end, product))
+                frame = self._bars(start, end)
+                frame.attrs["data_source"] = "test_provider"
+                return frame
+
+            first = load_history(
+                "510300",
+                "20260101",
+                "20260210",
+                network_fetcher=fetcher,
+                cache_root=root / "cache",
+                legacy_root=root / "legacy",
+            )
+            self.assertFalse(first.empty)
+            self.assertEqual(len(calls), 1)
+
+            def forbidden_fetcher(*_args) -> pd.DataFrame:
+                raise AssertionError("covered local range must not access the network")
+
+            second = load_history(
+                "510300",
+                "20260101",
+                "20260210",
+                network_fetcher=forbidden_fetcher,
+                cache_root=root / "cache",
+                legacy_root=root / "legacy",
+            )
+            self.assertTrue(second.attrs["cache_hit"])
+            self.assertEqual(second.attrs["network_calls"], 0)
+            self.assertEqual(len(second), len(first))
+
+    def test_missing_right_edge_fetches_only_the_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            calls = []
+
+            def fetcher(_code: str, start: str, end: str, _product: str) -> pd.DataFrame:
+                calls.append((start, end))
+                return self._bars(start, end)
+
+            load_history(
+                "510300",
+                "20260101",
+                "20260120",
+                network_fetcher=fetcher,
+                cache_root=root / "cache",
+                legacy_root=root / "legacy",
+            )
+            extended = load_history(
+                "510300",
+                "20260101",
+                "20260220",
+                network_fetcher=fetcher,
+                cache_root=root / "cache",
+                legacy_root=root / "legacy",
+            )
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(calls[1], ("20260121", "20260220"))
+            self.assertEqual(extended.attrs["network_calls"], 1)
+            self.assertEqual(extended["date"].max(), pd.Timestamp("2026-02-20"))
+
+    def test_monday_close_is_not_covered_by_previous_friday(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            calls = []
+
+            def fetcher(_code: str, start: str, end: str, _product: str) -> pd.DataFrame:
+                calls.append((start, end))
+                return self._bars(start, end)
+
+            load_history(
+                "510300",
+                "20260202",
+                "20260220",
+                network_fetcher=fetcher,
+                cache_root=root / "cache",
+                legacy_root=root / "legacy",
+            )
+            monday = load_history(
+                "510300",
+                "20260202",
+                "20260223",
+                network_fetcher=fetcher,
+                cache_root=root / "cache",
+                legacy_root=root / "legacy",
+            )
+            self.assertEqual(calls[-1], ("20260221", "20260223"))
+            self.assertEqual(monday["date"].max(), pd.Timestamp("2026-02-23"))
+            self.assertEqual(monday.attrs["network_calls"], 1)
+
+    def test_split_on_first_incremental_day_is_back_adjusted(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+
+            def fetcher(_code: str, start: str, end: str, _product: str) -> pd.DataFrame:
+                frame = self._bars(start, end)
+                if pd.to_datetime(end) <= pd.Timestamp("2026-01-20"):
+                    frame[["open", "high", "low", "close"]] *= 3
+                return frame
+
+            load_history(
+                "510300",
+                "20260102",
+                "20260120",
+                network_fetcher=fetcher,
+                cache_root=root / "cache",
+                legacy_root=root / "legacy",
+            )
+            merged = load_history(
+                "510300",
+                "20260102",
+                "20260206",
+                network_fetcher=fetcher,
+                cache_root=root / "cache",
+                legacy_root=root / "legacy",
+            )
+            boundary_return = merged.loc[
+                merged["date"] == pd.Timestamp("2026-01-21"),
+                "pct_chg",
+            ].iloc[0]
+            self.assertLess(abs(boundary_return), 5.0)
+
+    def test_offline_mode_never_calls_network(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+
+            def forbidden_fetcher(*_args) -> pd.DataFrame:
+                raise AssertionError("offline mode must not access the network")
+
+            result = load_history(
+                "510300",
+                "20260101",
+                "20260120",
+                network_fetcher=forbidden_fetcher,
+                offline=True,
+                cache_root=root / "cache",
+                legacy_root=root / "legacy",
+            )
+            self.assertTrue(result.empty)
+            self.assertEqual(result.attrs["network_calls"], 0)
+
+    def test_backtest_rejects_partial_offline_history(self) -> None:
+        partial = self._bars("2026-01-05", "2026-01-20")
+        partial.attrs["coverage_start_ok"] = False
+        partial.attrs["coverage_end_ok"] = True
+        with patch("backtest.fetch_etf_hist", return_value=partial):
+            with self.assertRaisesRegex(RuntimeError, "offline cache coverage incomplete"):
+                _fetch_hist_cached(
+                    "510300",
+                    "20260101",
+                    "20260120",
+                    "ETF",
+                    offline=True,
+                )
+
+    def test_legacy_full_history_recognizes_post_listing_start(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            legacy = root / "legacy"
+            legacy.mkdir()
+            self._bars("2025-10-22", "2026-02-20").to_csv(
+                legacy / "530100_ETF_20260501_20260725.csv",
+                index=False,
+            )
+
+            def forbidden_fetcher(*_args) -> pd.DataFrame:
+                raise AssertionError("pre-listing dates are not a network gap")
+
+            result = load_history(
+                "530100",
+                "20250719",
+                "20260220",
+                network_fetcher=forbidden_fetcher,
+                cache_root=root / "cache",
+                legacy_root=legacy,
+            )
+            self.assertTrue(result.attrs["cache_hit"])
+            self.assertTrue(result.attrs["coverage_start_ok"])
+            self.assertEqual(result.attrs["network_calls"], 0)
+
+    def test_trailing_features_have_no_future_leakage(self) -> None:
+        bars = self._bars("2025-01-01", "2026-02-20")
+        baseline = prepare_history(bars, source="test")
+        mutated_bars = bars.copy()
+        mutated_bars.loc[mutated_bars.index[-1], ["open", "high", "low", "close"]] *= 1.1
+        mutated = prepare_history(mutated_bars, source="test")
+
+        expected_columns = {
+            "return_20d_pct",
+            "ma_close_60",
+            "atr_pct_14",
+            "rsi_14",
+            "annualized_volatility_20d_pct",
+            "volume_ratio_5d",
+            "drawdown_60d_pct",
+            "obv",
+            "amihud_illiquidity_20d",
+        }
+        self.assertTrue(expected_columns.issubset(baseline.columns))
+        pd.testing.assert_frame_equal(
+            baseline.iloc[:-1].reset_index(drop=True),
+            mutated.iloc[:-1].reset_index(drop=True),
+            check_dtype=False,
+        )
 
 
 class EventRiskTests(unittest.TestCase):
