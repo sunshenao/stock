@@ -1,0 +1,112 @@
+{
+  "schema_version": 1,
+  "decision_type": "weekly_target",
+  "status": "blocked",
+  "blocking_errors": [
+    "evidence schema_version must be 2",
+    "evidence approval object is missing",
+    "evidence items must be an array"
+  ],
+  "orders_status": "blocked",
+  "order_blocking_errors": [
+    "account state is not user-confirmed",
+    "account confirmed_by is missing"
+  ],
+  "strategy_version": "2.4.1",
+  "strategy_sha256": "b1ca360b80a4a826832a4d55fd4725e2026bc011710aa5ddbd2e769d1c9a0a20",
+  "decision_engine_sha256": "cf901452d62cd631073df304dd2420debe8534644446f49d64142a1299633b6b",
+  "model_authority": {
+    "may": [
+      "summarize frozen inputs",
+      "draft thesis and invalidation text",
+      "report missing fields"
+    ],
+    "must_not": [
+      "reorder scanner candidates",
+      "change scanner target weights",
+      "set entry, stop, or target prices",
+      "approve evidence",
+      "create instruments outside the fixed pool",
+      "convert missing data into a trade"
+    ]
+  },
+  "as_of": {
+    "signal_date": "2026-07-27",
+    "data_cutoff": "2026-07-24 15:00",
+    "news_cutoff": "2026-07-26 23:59"
+  },
+  "market": {
+    "state": "退潮末期",
+    "event_risk": "黄色",
+    "event_action": "不提高总风险预算；被否决风险簇禁止新开，观察项须价格与资金双确认"
+  },
+  "scanner_candidates": [
+    {
+      "rank": 1,
+      "code": "159985",
+      "name": "豆粕ETF华夏",
+      "direction": "豆粕华夏",
+      "product_type": "ETF",
+      "industry": "周期",
+      "stage": "扩散期",
+      "score": 85.6,
+      "mainline_score": 89.1,
+      "timing_score": 79.1,
+      "risk_penalty": 0.0,
+      "scanner_weight_pct": 24.0
+    }
+  ],
+  "rejected_candidates": [
+    {
+      "rank": 1,
+      "code": "159985",
+      "name": "豆粕ETF华夏",
+      "direction": "豆粕华夏",
+      "product_type": "ETF",
+      "industry": "周期",
+      "stage": "扩散期",
+      "score": 85.6,
+      "mainline_score": 89.1,
+      "timing_score": 79.1,
+      "risk_penalty": 0.0,
+      "scanner_weight_pct": 24.0,
+      "evidence_status": "missing",
+      "rejection_reason": "EVIDENCE_NOT_APPROVED"
+    }
+  ],
+  "explanations": [],
+  "portfolio": {
+    "targets": [],
+    "cash_pct": 100.0,
+    "scanner_cash_pct_before_evidence": 76.0
+  },
+  "orders": [],
+  "input_hashes": {
+    "scan": {
+      "path": "codex/stock/2026-07-27/scan.json",
+      "sha256": "9f25b853da75ba37a72d1300db008a06d4cbfe4f588d4413726d4edcf9aab616"
+    },
+    "scanner_report": {
+      "path": "codex/stock/2026-07-27/etf_scan.md",
+      "sha256": "ff8840a9d6f65ac4ed03f10ff69e054914211b344ad278282919d86a68f6b9a8"
+    },
+    "event_ledger": {
+      "path": "codex/stock/event_ledger.csv",
+      "sha256": "3265145f2825ac4aa6864abb00cf0e7d9e04628d6be7ca32871f05a0cab044b2"
+    },
+    "evidence": {
+      "path": "codex/stock/2026-07-27/selection_evidence.json",
+      "sha256": "227703b0d6a6699f983f4fbaeb762fe84d72698fdbe43b11f90da1e458ef0f1c"
+    },
+    "event_review": {
+      "path": "codex/stock/2026-07-27/event_risk.md",
+      "sha256": "40bf2d2286211b93c31cad4fcd8f3695aad93823b72343920e7336b2ed9f3a82"
+    },
+    "account_state": {
+      "path": "codex/stock/account_state.json",
+      "sha256": "116a86f4ac82094ca4fed1762c36100082f1df42c08be25a5de0887fa9b2bcd9"
+    }
+  },
+  "portfolio_fingerprint": "e2bcf182ee7d20c6207f82cef1ac180eb4826cb8f65e8575ce346d1b2e01737e",
+  "contract_sha256": "b93d92205fe158a547dcc69a0289ca301358890085d4b7d36b257c1a7511822e"
+}

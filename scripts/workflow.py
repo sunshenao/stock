@@ -16,7 +16,8 @@ from pathlib import Path
 from event_risk import DEFAULT_LEDGER, write_event_review
 from daily_risk import detect_cluster_crashes
 from risk_rules import get_target_exposure, risk_cluster
-from selection_guard import _extract_portfolio_holdings, validate_selection
+from decision_contract import verify_decision
+from strategy_version import load_current_manifest, verify_manifest
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -25,9 +26,77 @@ STOCK_DIR = PROJECT_ROOT / "codex" / "stock"
 
 MODE_OUTPUTS = {
     "monthly": "monthly_review.md",
-    "weekly": "selection.md",
+    "weekly": "selection.generated.md",
     "daily": "risk_review.md",
 }
+
+
+def _record_assumed_formal_recommendation(
+    decision_path: Path,
+    account_path: Path,
+) -> dict:
+    """Persist a verified executable recommendation as the assumed account."""
+    decision = json.loads(decision_path.read_text(encoding="utf-8-sig"))
+    if decision.get("status") != "ready" or decision.get("orders_status") != "ready":
+        raise ValueError("only ready executable decisions may update account state")
+
+    portfolio = decision.get("portfolio") or {}
+    targets = portfolio.get("targets")
+    if not isinstance(targets, list):
+        raise ValueError("decision portfolio targets must be an array")
+
+    cutoff = str((decision.get("as_of") or {}).get("data_cutoff") or "")
+    contract_hash = str(decision.get("contract_sha256") or "")
+    positions = []
+    for row in targets:
+        execution = row.get("execution") or {}
+        reference_close = execution.get("reference_close")
+        positions.append(
+            {
+                "code": str(row["code"]),
+                "name": str(row.get("name") or ""),
+                "weight_pct": float(row["target_weight_pct"]),
+                "entry_price": (
+                    float(reference_close) if reference_close is not None else None
+                ),
+                "entry_price_source": "decision_reference_close",
+                "assumed_fill_time": cutoff,
+                "execution_status": "assumed_filled_on_recommendation",
+                "recommendation_contract": contract_hash,
+            }
+        )
+
+    account = {
+        "schema_version": 1,
+        "as_of": cutoff,
+        "confirmed": True,
+        "confirmed_by": "user_auto_assume_recommendations",
+        "assumption_mode": "auto_assume_formal_recommendations_filled",
+        "execution_price_policy": (
+            "formal executable recommendations are booked immediately at the "
+            "decision reference close; user-reported broker fills take precedence"
+        ),
+        "source_instruction_date": "2026-07-27",
+        "cash_pct": float(portfolio.get("cash_pct") or 0.0),
+        "positions": positions,
+        "last_recommendation": {
+            "signal_date": str((decision.get("as_of") or {}).get("signal_date") or ""),
+            "strategy_version": str(decision.get("strategy_version") or ""),
+            "decision_contract": contract_hash,
+            "portfolio_fingerprint": str(
+                decision.get("portfolio_fingerprint") or ""
+            ),
+            "decision_path": str(decision_path.resolve()),
+        },
+    }
+    account_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = account_path.with_suffix(account_path.suffix + ".tmp")
+    temp_path.write_text(
+        json.dumps(account, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    temp_path.replace(account_path)
+    return account
 
 
 def _pool_codes() -> set[str]:
@@ -50,6 +119,28 @@ def _validate_scan(scan_path: Path, target_date: str) -> tuple[bool, list[str]]:
     scan_date = str(data.get("date") or data.get("scan_date") or "")
     if scan_date and scan_date != target_date:
         errors.append(f"扫描日期 {scan_date} 与目标日期 {target_date} 不一致")
+    if data.get("schema_version") != 2:
+        errors.append("scan.json schema_version 必须为 2")
+    cutoff_text = str(data.get("data_cutoff") or "")
+    try:
+        cutoff = datetime.fromisoformat(cutoff_text)
+        target = datetime.strptime(target_date, "%Y-%m-%d")
+        if cutoff.date() > target.date():
+            errors.append("扫描数据截止时间晚于目标日期")
+    except ValueError:
+        errors.append("scan.json 缺少有效 data_cutoff")
+
+    manifest = load_current_manifest() or {}
+    manifest_ok, manifest_errors = verify_manifest(manifest)
+    if not manifest or not manifest_ok:
+        errors.extend(f"冻结策略无效: {error}" for error in manifest_errors)
+        if not manifest:
+            errors.append("当前冻结策略清单缺失")
+    else:
+        if data.get("strategy_version") != manifest.get("strategy_version"):
+            errors.append("扫描策略版本不是当前冻结版本")
+        if data.get("strategy_sha256") != manifest.get("combined_sha256"):
+            errors.append("扫描策略哈希不是当前冻结版本")
 
     allowed = _pool_codes()
     codes = {str(row.get("code") or "") for row in rows if row.get("code")}
@@ -67,10 +158,35 @@ def _market_state_from_report(report_path: Path) -> str:
     return match.group(1).strip() if match else "未知"
 
 
-def _confirmed_positions() -> list[dict]:
+def _confirmed_positions() -> tuple[list[dict], bool]:
+    account_path = STOCK_DIR / "account_state.json"
+    if account_path.exists():
+        try:
+            account = json.loads(account_path.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError):
+            account = None
+        if isinstance(account, dict) and account.get("confirmed") is True:
+            rows = account.get("positions")
+            if isinstance(rows, list):
+                positions = [
+                    {
+                        "code": str(row.get("code") or ""),
+                        "name": str(row.get("name") or ""),
+                        "position": f"{float(row.get('weight_pct') or 0):g}%",
+                        "source": "结构化账户",
+                    }
+                    for row in rows
+                    if (
+                        isinstance(row, dict)
+                        and re.fullmatch(r"\d{6}", str(row.get("code") or ""))
+                        and float(row.get("weight_pct") or 0) > 0
+                    )
+                ]
+                return positions, True
+
     path = STOCK_DIR / "current_positions.md"
     if not path.exists():
-        return []
+        return [], False
     positions = []
     for line in path.read_text(encoding="utf-8-sig").splitlines():
         if not line.lstrip().startswith("|"):
@@ -87,13 +203,13 @@ def _confirmed_positions() -> list[dict]:
             "position": cells[2],
             "source": "实际账户",
         })
-    return positions
+    return positions, bool(positions)
 
 
 def _latest_weekly_model(target_date: str, max_age_days: int = 8) -> tuple[Path | None, list[dict]]:
     target = datetime.strptime(target_date, "%Y-%m-%d").date()
     candidates = []
-    for path in STOCK_DIR.glob("????-??-??/selection.md"):
+    for path in STOCK_DIR.glob("????-??-??/decision.json"):
         try:
             plan_date = datetime.strptime(path.parent.name, "%Y-%m-%d").date()
         except ValueError:
@@ -102,24 +218,24 @@ def _latest_weekly_model(target_date: str, max_age_days: int = 8) -> tuple[Path 
         if 0 <= age <= max_age_days:
             candidates.append((plan_date, path))
     for _, path in sorted(candidates, reverse=True):
-        ok, _ = validate_selection(path)
+        ok, _ = verify_decision(path)
         if not ok:
+            continue
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+        if (
+            payload.get("status") != "ready"
+            or payload.get("orders_status") != "ready"
+        ):
             continue
         holdings = [
             {
-                "code": holding.code,
-                "name": re.sub(r"`?\d{6}`?", "", holding.instrument).strip(),
-                "position": (
-                    f"{holding.position_low:g}%"
-                    if holding.position_low == holding.position_high
-                    else f"{holding.position_low:g}-{holding.position_high:g}%"
-                ),
+                "code": str(holding.get("code") or ""),
+                "name": str(holding.get("name") or ""),
+                "position": f"{float(holding.get('target_weight_pct') or 0):g}%",
                 "source": "周度模型",
             }
-            for holding in _extract_portfolio_holdings(
-                path.read_text(encoding="utf-8-sig")
-            )
-            if not holding.is_cash
+            for holding in payload.get("portfolio", {}).get("targets", [])
+            if float(holding.get("target_weight_pct") or 0) > 0
         ]
         if holdings:
             return path, holdings
@@ -137,9 +253,9 @@ def _write_daily_risk_review(
     rows = scan.get("rows") or []
     by_code = {str(row.get("code")): row for row in rows if row.get("code")}
     market_state = _market_state_from_report(report_path)
-    positions = _confirmed_positions()
+    positions, account_authoritative = _confirmed_positions()
     selection_path = None
-    if not positions:
+    if not positions and not account_authoritative:
         selection_path, positions = _latest_weekly_model(target_date)
     cluster_crashes = detect_cluster_crashes(rows)
     blocked_scopes = set(event_snapshot.get("blocked_scopes") or [])
@@ -200,8 +316,8 @@ def _write_daily_risk_review(
     if market_state == "冰点":
         hard_action = True
     source_text = (
-        "实际账户"
-        if _confirmed_positions()
+        "结构化账户（用户授权：正式推荐视为成交）"
+        if account_authoritative
         else (
             f"周度模型 {selection_path.relative_to(PROJECT_ROOT)}"
             if selection_path
@@ -248,7 +364,7 @@ def _write_daily_risk_review(
         "## 日度权限边界",
         "",
         "- 允许：执行既定止损、催化证伪退出、冰点降仓、大风险簇降仓。",
-        "- 禁止：根据今日TOP排名卖旧买新、重新生成三只组合、提高未列入周度方案的标的仓位。",
+        "- 禁止：根据今日TOP排名卖旧买新、重新生成0–3只组合、提高未列入周度方案的标的仓位。",
         "- 国际利好只能验证周度候选；国际利空必须同时得到价格或资金走弱确认后才触发持仓动作，全球红色风险除外。",
         "",
     ])
@@ -279,9 +395,9 @@ def _print_next_step(mode: str, target_date: str, output_path: Path) -> None:
         print(f"记录位置: {relative}")
         print("不得在月度复核中直接生成可执行调仓。")
     elif mode == "weekly":
-        print("\n周度职责：这是唯一正式选3只和调整目标仓位的频率。")
+        print("\n周度职责：扫描器和决策契约是唯一候选、仓位与订单口径。")
         print(f"正式方案: {relative}")
-        print("方案必须写明“调仓频率：周度”，并在下一交易日开盘执行。")
+        print("模型只能起草证据；selection.generated.md 必须由 decision.json 确定性生成。")
         print(f"校验命令: python scripts/selection_guard.py {relative}")
     else:
         print("\n日度职责：只检查持仓止损、催化证伪、大簇崩盘和市场冰点。")
@@ -310,6 +426,15 @@ def main() -> None:
         action="store_true",
         help="已有同日 scan.json 时直接校验并复用",
     )
+    parser.add_argument(
+        "--evidence",
+        help="周度证据JSON，默认 codex/stock/YYYY-MM-DD/weekly_evidence.json",
+    )
+    parser.add_argument(
+        "--account-state",
+        default=str(STOCK_DIR / "account_state.json"),
+        help="用户确认的结构化账户状态",
+    )
     args = parser.parse_args()
 
     target_date = args.date or datetime.now().strftime("%Y-%m-%d")
@@ -334,12 +459,16 @@ def main() -> None:
         raise SystemExit(3)
 
     output_path = day_dir / MODE_OUTPUTS[args.mode]
-    news_cutoff = (
-        datetime.fromisoformat(args.news_cutoff)
-        if args.news_cutoff
-        else datetime.strptime(target_date, "%Y-%m-%d")
-        + timedelta(hours=23, minutes=59)
-    )
+    if args.news_cutoff:
+        news_cutoff = datetime.fromisoformat(args.news_cutoff)
+    else:
+        target_day = datetime.strptime(target_date, "%Y-%m-%d")
+        now = datetime.now().replace(second=0, microsecond=0)
+        news_cutoff = (
+            target_day + timedelta(hours=23, minutes=59)
+            if target_day.date() < now.date()
+            else now
+        )
     event_path, event_snapshot = write_event_review(
         news_cutoff,
         day_dir / "event_risk.md",
@@ -358,6 +487,39 @@ def main() -> None:
             output_path,
             event_snapshot,
         )
+    elif args.mode == "weekly":
+        evidence_path = (
+            Path(args.evidence)
+            if args.evidence
+            else day_dir / "weekly_evidence.json"
+        )
+        if not evidence_path.is_absolute():
+            evidence_path = PROJECT_ROOT / evidence_path
+        account_path = Path(args.account_state)
+        if not account_path.is_absolute():
+            account_path = PROJECT_ROOT / account_path
+        if not evidence_path.exists():
+            print(
+                "周度流程失败关闭：缺少 weekly_evidence.json。"
+                "模型手写 selection.md 不会被采用。",
+                file=sys.stderr,
+            )
+            print(f"需要证据文件: {evidence_path.relative_to(PROJECT_ROOT)}", file=sys.stderr)
+            raise SystemExit(4)
+        command = [
+            sys.executable,
+            str(SCRIPT_DIR / "decision_contract.py"),
+            "build",
+            "--date",
+            target_date,
+            "--evidence",
+            str(evidence_path),
+            "--account-state",
+            str(account_path),
+        ]
+        compiled = subprocess.run(command, cwd=PROJECT_ROOT)
+        if compiled.returncode:
+            raise SystemExit(compiled.returncode)
     print(f"扫描校验通过: {scan_path.relative_to(PROJECT_ROOT)}")
     _print_next_step(args.mode, target_date, output_path)
 
@@ -369,10 +531,28 @@ def main() -> None:
         )
         raise SystemExit(4)
     if args.mode == "weekly":
+        decision_path = day_dir / "decision.json"
+        contract = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT_DIR / "decision_contract.py"),
+                "verify",
+                str(decision_path),
+            ],
+            cwd=PROJECT_ROOT,
+        )
+        if contract.returncode:
+            raise SystemExit(contract.returncode)
         guard = subprocess.run(
             [sys.executable, str(SCRIPT_DIR / "selection_guard.py"), str(output_path)],
             cwd=PROJECT_ROOT,
         )
+        if guard.returncode == 0:
+            _record_assumed_formal_recommendation(decision_path, account_path)
+            print(
+                "正式推荐已按用户授权视为成交并写入账户: "
+                f"{account_path.relative_to(PROJECT_ROOT)}"
+            )
         raise SystemExit(guard.returncode)
 
 

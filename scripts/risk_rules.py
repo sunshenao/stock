@@ -19,11 +19,35 @@ class PositionCap:
         return f"{self.low}-{self.high}%"
 
 
-TARGET_SELECTION_COUNT = 3
+# 正式组合允许 0-3 只；3 只是上限，不再是必须凑满的目标。
+MAX_SELECTION_COUNT = 3
+TARGET_SELECTION_COUNT = MAX_SELECTION_COUNT  # 兼容旧调用，语义为“最多”
 RANK_WEIGHT_RATIOS = (0.40, 0.35, 0.25)
 MAX_SAME_RISK_CLUSTER = 2
-CORE_ENTRY_SCORE = 45.0
-FALLBACK_ENTRY_SCORE = 30.0
+CORE_ENTRY_SCORE = 65.0
+FALLBACK_ENTRY_SCORE = 65.0  # 不再启用低门槛补位，保留名称仅兼容旧导入
+MAX_NEW_POSITION_ONE_DAY_DOMINANCE = 0.60
+
+# 主线、买点、风险三层必须分别通过。主线门槛随市场状态收紧，
+# 避免在全市场都弱时因为“相对第一”而被迫交易。
+MAINLINE_SCORE_FLOORS: dict[str, float] = {
+    "主升": 58.0,
+    "震荡": 62.0,
+    "退潮": 66.0,
+    "退潮末期": 70.0,
+    "冰点": 75.0,
+    "未知": 70.0,
+}
+MIN_TIMING_SCORE = 50.0
+MAX_ENTRY_RISK_PENALTY = 18.0
+MAX_SELECTION_BY_STATE: dict[str, int] = {
+    "主升": 3,
+    "震荡": 2,
+    "退潮": 2,
+    "退潮末期": 1,
+    "冰点": 1,
+    "未知": 1,
+}
 
 # 中期下跌中的短线反抽最容易制造“高分追入、下一周止损”。非防守
 # 新仓若60日趋势仍为负，必须同时满足更高评分和20日反转强度。
@@ -49,21 +73,21 @@ HIGH_BETA_NAME_KEYWORDS = (
     "中证2000",
 )
 
-# 非冰点现金不得超过 40%。目标仓位取区间上限，区间下限供
-# selection_guard 判断是否出现异常低资金利用率。
+# 组合允许主动空仓。这里的 high 是各市场状态下、候选充足时的风险预算
+# 上限；low 固定为 0，不再把“资金利用率”当成必须凑标的的理由。
 MARKET_POSITION_CAPS: dict[str, PositionCap] = {
-    "主升": PositionCap(90, 100),
-    "震荡": PositionCap(80, 90),
-    "退潮": PositionCap(60, 70),
-    "退潮末期": PositionCap(60, 60),
-    "冰点": PositionCap(20, 40),
-    "未知": PositionCap(60, 60),
+    "主升": PositionCap(80, 100),
+    "震荡": PositionCap(70, 100),
+    "退潮": PositionCap(60, 90),
+    "退潮末期": PositionCap(60, 80),
+    "冰点": PositionCap(0, 40),
+    "未知": PositionCap(60, 80),
 }
 
 SINGLE_POSITION_CAPS: dict[str, int] = {
-    "stock": 40,
-    "etf": 40,
-    "lof": 35,
+    "stock": 100,
+    "etf": 100,
+    "lof": 100,
     "qdii": 25,
     "cash": 100,
 }
@@ -80,6 +104,11 @@ def get_position_cap(market_state: str) -> PositionCap:
     return MARKET_POSITION_CAPS.get(market_state, MARKET_POSITION_CAPS["未知"])
 
 
+def category_root(category: str) -> str:
+    """Return the policy category before an optional ``/sub-theme`` suffix."""
+    return str(category or "其他").split("/")[0]
+
+
 def get_target_exposure(market_state: str) -> int:
     """返回当前市场状态的标准目标仓位。"""
     return get_position_cap(market_state).high
@@ -89,22 +118,92 @@ def allocate_ranked_weights(
     market_state: str,
     count: int = TARGET_SELECTION_COUNT,
 ) -> list[float]:
-    """按排名分配目标仓位，默认三只为 40%/35%/25% 的强弱结构。
+    """将风险预算按实际通过门禁的标的数量归一化分配。
 
-    返回值是账户总资产百分比，而不是组合内部权重。三只标的时总和
-    精确等于市场目标仓位；标的不足时不机械把弱机会的仓位放大。
+    一只获得全部市场风险预算；两只按 40:35 分配；三只按 40:35:25
+    分配。这里只放大已经通过全部质量门禁的标的，不会加入弱候选补位。
     """
     if count <= 0:
         return []
+    count = min(int(count), TARGET_SELECTION_COUNT)
     target = float(get_target_exposure(market_state))
     ratios = list(RANK_WEIGHT_RATIOS[:count])
     if not ratios:
         return []
 
-    weights = [round(target * ratio, 1) for ratio in ratios]
-    if count == TARGET_SELECTION_COUNT:
-        weights[-1] = round(target - sum(weights[:-1]), 1)
+    ratio_sum = sum(ratios)
+    weights = [round(target * ratio / ratio_sum, 1) for ratio in ratios]
+    weights[-1] = round(target - sum(weights[:-1]), 1)
     return weights
+
+
+def allocate_instrument_weights(
+    market_state: str,
+    instruments: list[dict],
+) -> list[float]:
+    """按排名和产品上限分配账户仓位，未使用的风险预算保留为现金。"""
+    base = allocate_ranked_weights(market_state, len(instruments))
+    return [
+        min(
+            weight,
+            float(single_position_cap(
+                item.get("product_type", "ETF"),
+                bool(item.get("is_qdii", False)),
+            )),
+            15.0
+            if item.get("is_qdii", False) and item.get("premium_pct") is None
+            else float("inf"),
+        )
+        for weight, item in zip(base, instruments)
+    ]
+
+
+def max_selection_count(market_state: str) -> int:
+    return MAX_SELECTION_BY_STATE.get(market_state, MAX_SELECTION_BY_STATE["未知"])
+
+
+def max_same_risk_cluster(market_state: str) -> int:
+    """防守市场不允许两个席位同时押在同一风险簇。"""
+    return MAX_SAME_RISK_CLUSTER if market_state in {"主升", "震荡"} else 1
+
+
+def mainline_score_floor(market_state: str) -> float:
+    return MAINLINE_SCORE_FLOORS.get(market_state, MAINLINE_SCORE_FLOORS["未知"])
+
+
+def carry_mainline_floor(market_state: str) -> float:
+    """旧仓只获得5分缓冲，不因续持身份无限绕过主线门槛。"""
+    return max(45.0, mainline_score_floor(market_state) - 5.0)
+
+
+def score_layers_pass(score: dict, market_state: str) -> tuple[bool, str]:
+    """检查主线、买点和风险三层，不允许总分掩盖任一层失败。"""
+    total = float(score.get("total") or 0)
+    raw_total = float(score.get("raw_total") or total)
+    mainline = float(score.get("mainline") or 0)
+    timing = float(score.get("timing") or 0)
+    risk_penalty = float(score.get("risk_penalty") or 0)
+    one_day_dominance = float(score.get("one_day_dominance") or 0)
+    floor = mainline_score_floor(market_state)
+    if raw_total < CORE_ENTRY_SCORE:
+        return False, f"折溢价前总分{raw_total:.1f}<{CORE_ENTRY_SCORE:.0f}"
+    if mainline < floor:
+        return False, f"主线分{mainline:.1f}<{floor:.0f}"
+    if timing < MIN_TIMING_SCORE:
+        return False, f"买点分{timing:.1f}<{MIN_TIMING_SCORE:.0f}"
+    if risk_penalty > MAX_ENTRY_RISK_PENALTY:
+        return False, f"风险惩罚{risk_penalty:.1f}>{MAX_ENTRY_RISK_PENALTY:.0f}"
+    if one_day_dominance > MAX_NEW_POSITION_ONE_DAY_DOMINANCE:
+        return (
+            False,
+            "5日涨幅单日贡献"
+            f"{one_day_dominance:.0%}>{MAX_NEW_POSITION_ONE_DAY_DOMINANCE:.0%}",
+        )
+    if not bool(score.get("mainline_pass", True)):
+        return False, str(score.get("gate_reason") or "主线持续性门禁未通过")
+    if not bool(score.get("timing_pass", True)):
+        return False, str(score.get("gate_reason") or "买点门禁未通过")
+    return True, ""
 
 
 def get_target_cash(market_state: str) -> int:
@@ -116,13 +215,13 @@ def is_ice_point(market_state: str) -> bool:
 
 
 def is_defensive_state(market_state: str) -> bool:
-    """只有冰点允许现金 > 40%。退潮/退潮末期现金仍须 < 40%（规则 8/9）。"""
-    return market_state in {"冰点"}
+    """退潮及更弱状态都允许主动提高现金。"""
+    return market_state in {"退潮", "退潮末期", "冰点", "未知"}
 
 
 def requires_aggressive_deployment(market_state: str) -> bool:
-    """冰点以外所有市场状态均要求至少 60% 仓位。"""
-    return market_state != "冰点"
+    """非冰点组合必须达到对应状态的最低风险预算。"""
+    return not is_ice_point(market_state)
 
 
 def instrument_key(product_type: str, is_qdii: bool = False) -> str:
@@ -164,30 +263,31 @@ def risk_cluster(
 ) -> str:
     """Map different labels with similar tail risk into one portfolio cluster."""
     category = str(category or "其他")
+    major_category = category_root(category)
     industry = str(industry or "其他")
     name = str(instrument_name or "")
 
-    if category in HIGH_BETA_CATEGORIES or any(
+    if major_category in HIGH_BETA_CATEGORIES or any(
         keyword.lower() in name.lower()
         for keyword in HIGH_BETA_NAME_KEYWORDS
     ):
         return "高弹性成长"
-    if category in {"资源", "商品"} or industry == "周期":
+    if major_category in {"资源", "商品"} or industry == "周期":
         return "资源商品"
-    if category in DEFENSIVE_CATEGORIES or industry in {
+    if major_category in DEFENSIVE_CATEGORIES or industry in {
         "金融",
         "公用事业",
         "红利",
         "债券",
     }:
         return "防御价值"
-    if category == "医药" or industry == "医药":
+    if major_category == "医药" or industry == "医药":
         return "医药"
-    if category == "消费" or industry == "消费":
+    if major_category == "消费" or industry == "消费":
         return "消费"
-    if category in {"跨境", "LOF"}:
+    if major_category in {"跨境", "LOF"}:
         return "跨境"
-    if category == "宽基" or industry == "宽基":
+    if major_category == "宽基" or industry == "宽基":
         return "宽基"
     return f"{category}/{industry}"
 
@@ -202,7 +302,8 @@ def new_position_trend_gate(
 ) -> tuple[bool, str]:
     """Reject weak-medium-trend rebounds unless reversal evidence is unusually strong."""
     category = str(category or "其他")
-    if category in DEFENSIVE_CATEGORIES:
+    major_category = category_root(category)
+    if major_category in DEFENSIVE_CATEGORIES:
         return True, ""
     if ret_60d >= 0:
         return True, ""

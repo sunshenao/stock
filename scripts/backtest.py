@@ -33,9 +33,10 @@ from etf_analyzer import (  # noqa: E402
     NEW_MONEY_STAGES,
     STAGE_PRIORITY,
     _rank_key,
-    calc_auto_score,
+    apply_scoring_context,
     calc_consecutive_strong,
     calc_etf_metrics,
+    calc_relative_profile,
     classify_stage,
     fetch_etf_hist,
     load_etf_txt,
@@ -45,13 +46,18 @@ from execution_model import cost_return_pct, simulate_long_with_stop  # noqa: E4
 from market_state import breadth_ratio_on_date, classify_from_history  # noqa: E402
 from risk_rules import (  # noqa: E402
     CORE_ENTRY_SCORE,
-    FALLBACK_ENTRY_SCORE as POLICY_FALLBACK_ENTRY_SCORE,
+    MAX_NEW_POSITION_ONE_DAY_DOMINANCE,
     MAX_SAME_RISK_CLUSTER,
     TARGET_SELECTION_COUNT,
-    allocate_ranked_weights,
+    allocate_instrument_weights,
+    carry_mainline_floor,
+    category_root,
     get_target_exposure,
+    max_same_risk_cluster,
+    max_selection_count,
     new_position_trend_gate,
     risk_cluster,
+    score_layers_pass,
 )
 from universe_history import (  # noqa: E402
     active_codes as active_universe_codes,
@@ -73,10 +79,6 @@ STOP_SLIPPAGE_BPS = 10.0
 CHASE_5D_RETURN_LIMIT = 25.0
 CHASE_SINGLE_DAY_LIMIT = 4.0
 DEFENSIVE_STATES = {"退潮", "退潮末期", "冰点"}
-# 组合最低入选分数：分数低于此的候选不进入主仓；不再机械补足到 TOP N
-MIN_ENTRY_SCORE = CORE_ENTRY_SCORE
-FALLBACK_ENTRY_SCORE = POLICY_FALLBACK_ENTRY_SCORE
-FALLBACK_BLOCKED_STAGES = {"衰竭期", "衰弱期", "弱势期", "加速见顶⚠"}
 # 月频/周频止损规则：max(固定百分比, N × ATR)
 PERIOD_STOP_RULES = {
     "monthly": {
@@ -100,6 +102,8 @@ HOLD_BONUS = {
     "weekly": {"weak": 6.0, "normal": 6.0, "strong": 6.0},
     "monthly": {"weak": 6.0, "normal": 6.0, "strong": 6.0},
 }
+MIN_HOLD_TRADING_DAYS = 10
+MIN_HOLD_PRIORITY_BONUS = 100.0
 BENCHMARKS = {
     "510300": "沪深300ETF",
     "512500": "中证500ETF",
@@ -284,7 +288,7 @@ def _classify_loss_row(row: pd.Series) -> tuple[str, str]:
         responsibility = "框架主要责任，不能归因于大盘"
     else:
         conclusion = "组合内部波动为主"
-        responsibility = "框架需复核补位、续持和交易成本"
+        responsibility = "框架需复核续持、风险暴露和交易成本"
 
     evidence = str(row.get("risk_flags") or "").strip()
     if not evidence or evidence == "—":
@@ -600,7 +604,8 @@ def _ma_close(df: pd.DataFrame, dt, window: int) -> float | None:
 
 def _is_commodity_like(item: dict) -> bool:
     product_type = str(item.get("product_type", "")).upper()
-    return product_type == "LOF" or item.get("category") in COMMODITY_CATEGORIES
+    major_category = category_root(item.get("category", ""))
+    return product_type == "LOF" or major_category in COMMODITY_CATEGORIES
 
 
 def _trend_stop_triggered(
@@ -658,6 +663,7 @@ def _should_hold_position(
     ranked_by_code: dict[str, dict],
     data: dict[str, pd.DataFrame],
     signal_date: pd.Timestamp,
+    market_state: str = "未知",
 ) -> tuple[bool, str, dict | None]:
     current = ranked_by_code.get(previous["etf_code"])
     if current is None:
@@ -676,6 +682,18 @@ def _should_hold_position(
     peak_score = max(float(previous.get("peak_score") or current_score), current_score)
     score_drop = 1 - current_score / peak_score if peak_score > 0 else 0.0
     rank = int(current.get("_rank") or 999)
+    score_detail = current.get("score", {})
+    mainline_score = float(score_detail.get("mainline") or 0)
+    risk_penalty = float(score_detail.get("risk_penalty") or 0)
+
+    if "mainline" in score_detail:
+        carry_floor = carry_mainline_floor(market_state)
+        if mainline_score < carry_floor:
+            return False, f"主线分{mainline_score:.1f}跌破续持门槛{carry_floor:.1f}", current
+    if mainline_score < 45 and ret20 < 0:
+        return False, f"主线分降至{mainline_score:.1f}且20日趋势转负", current
+    if risk_penalty > 30:
+        return False, f"风险惩罚升至{risk_penalty:.1f}", current
 
     if stage in HOLDABLE_STAGES:
         return True, f"{stage}续持", current
@@ -688,17 +706,34 @@ def _should_hold_position(
     return False, f"{stage}不再持有", current
 
 
+def _trading_days_held(
+    frame: pd.DataFrame,
+    holding_since,
+    signal_date,
+) -> int:
+    """Count known trading days since entry without a calendar-day shortcut."""
+    if frame.empty or not holding_since:
+        return 0
+    start = pd.to_datetime(holding_since)
+    end = pd.to_datetime(signal_date)
+    return int(
+        frame.loc[
+            (frame["date"] >= start) & (frame["date"] <= end),
+            "date",
+        ].nunique()
+    )
+
+
 def _new_position_allowed(item: dict, market_state: str) -> bool:
-    """弱市过滤：冰点不新开仓，退潮/退潮末期提高新开仓门槛。"""
-    if market_state == "冰点":
-        return False
-    if item.get("is_qdii") and not _is_commodity_like(item):
-        return False
+    """新仓必须分别通过主线、买点和风险层，不因席位空缺而降级补位。"""
     if _is_chase_high(item, market_state):
         return False
 
     metrics = item.get("metrics", {})
     score = float(item.get("score", {}).get("total") or 0)
+    layers_ok, _ = score_layers_pass(item.get("score", {}), market_state)
+    if not layers_ok:
+        return False
     stage = item.get("stage", ("", "", ""))[0]
     ret5 = float(metrics.get("ret_5d") or 0)
     ret20 = float(metrics.get("ret_20d") or 0)
@@ -713,38 +748,18 @@ def _new_position_allowed(item: dict, market_state: str) -> bool:
     if not trend_ok:
         return False
 
-    if market_state == "退潮末期":
-        # 退潮末期只做主力真流入 + 独立叙事的候选：分数≥60、且短期动量非负
-        if score < 60 or stage not in {"扩散期", "加速期", "确认期"}:
+    if market_state in {"退潮末期", "冰点"}:
+        if stage not in {"扩散期", "加速期", "确认期"}:
             return False
         return ret5 > 0
 
     if market_state == "退潮":
-        if score < 55 or stage not in {"扩散期", "加速期", "确认期"}:
+        if stage not in {"扩散期", "加速期", "确认期"}:
             return False
         if item.get("industry") == "周期" or item.get("category") in COMMODITY_CATEGORIES:
-            return ret5 > 0 and ret20 > 0 and score >= 60
+            return ret5 > 0 and ret20 > 0
         return ret5 > 0 or ret20 > 0
 
-    return True
-
-
-def _fallback_position_allowed(item: dict, market_state: str) -> bool:
-    """三标的补位门禁：允许较早/横盘阶段，但拒绝衰竭、追高和高风险跨境品种。"""
-    if item.get("is_qdii") and not _is_commodity_like(item):
-        return False
-    if _is_chase_high(item, market_state):
-        return False
-
-    score = float(item.get("score", {}).get("total") or 0)
-    stage = item.get("stage", ("", "", ""))[0]
-    if score < FALLBACK_ENTRY_SCORE or stage in FALLBACK_BLOCKED_STAGES:
-        return False
-
-    metrics = item.get("metrics", {})
-    ret20 = float(metrics.get("ret_20d") or 0)
-    if market_state in {"退潮", "退潮末期", "冰点"} and ret20 < -8:
-        return False
     return True
 
 
@@ -770,15 +785,11 @@ def _selection_priority(item: dict, freq: str) -> tuple:
     score = float(item.get("score", {}).get("total") or 0)
     if item.get("entry_tier") == "核心":
         score += 3.0
-    elif item.get("entry_tier") == "补位":
-        score -= 3.0
-    elif item.get("entry_tier") == "防守补位":
-        score -= 10.0
-        if item.get("industry") in {"宽基", "红利", "公用事业", "金融", "债券"}:
-            score += 8.0
     if item.get("entry_type") == "续持":
         bonus_table = HOLD_BONUS.get(freq, HOLD_BONUS["monthly"])
         score += bonus_table["normal"]
+        if freq == "weekly" and item.get("minimum_hold_protected"):
+            score += MIN_HOLD_PRIORITY_BONUS
     stage = item.get("stage", ("", "", ""))[0]
     return (
         score,
@@ -797,9 +808,10 @@ def _select_top_candidates(
 ) -> list[dict]:
     """
     从旧仓和新候选中统一选 TOP。
-    - 主候选和补位候选已在上游分别通过质量门禁。
+    - 新仓已在上游分别通过主线、买点和风险门禁。
     - 周度更强调主线弹性：最多保留 1 个宽基，避免宽基挤占产业 ETF 名额。
     """
+    top_n = min(top_n, max_selection_count(market_state))
     ordered = sorted(candidate_pool, key=lambda r: _selection_priority(r, freq), reverse=True)
     if freq != "weekly":
         return ordered[:top_n]
@@ -809,11 +821,7 @@ def _select_top_candidates(
     broad_count = 0
     industry_count: dict[str, int] = {}
     cluster_count: dict[str, int] = {}
-    cluster_limit = (
-        TARGET_SELECTION_COUNT
-        if market_state == "主升"
-        else MAX_SAME_RISK_CLUSTER
-    )
+    cluster_limit = max_same_risk_cluster(market_state)
     for r in ordered:
         if len(selected) >= top_n:
             break
@@ -828,10 +836,7 @@ def _select_top_candidates(
             continue
         if industry != "宽基" and industry_count.get(industry, 0) >= WEEKLY_MAX_SAME_INDUSTRY:
             continue
-        if (
-            cluster_count.get(cluster, 0) >= cluster_limit
-            and r.get("entry_type") != "续持"
-        ):
+        if cluster_count.get(cluster, 0) >= cluster_limit:
             continue
         selected.append(r)
         if industry == "宽基":
@@ -848,10 +853,7 @@ def _select_top_candidates(
                 r.get("industry", "其他"),
                 r.get("etf_name", ""),
             )
-            if (
-                cluster_count.get(cluster, 0) >= cluster_limit
-                and r.get("entry_type") != "续持"
-            ):
+            if cluster_count.get(cluster, 0) >= cluster_limit:
                 continue
             selected.append(r)
             cluster_count[cluster] = cluster_count.get(cluster, 0) + 1
@@ -949,7 +951,7 @@ def rank_on_signal_date(
     for direction, cfg in etf_pool.items():
         if allowed_codes is not None and cfg["code"] not in allowed_codes:
             continue
-        if cfg.get("cat") == "货币":
+        if category_root(cfg.get("cat", "")) in {"货币", "债券"}:
             continue
         df = data.get(cfg["code"])
         if df is None or df.empty:
@@ -961,6 +963,9 @@ def rank_on_signal_date(
         metrics = calc_etf_metrics(df, _fmt_date(effective_signal))
         if "error" in metrics:
             continue
+        metrics.update(
+            calc_relative_profile(df, bench_df, _fmt_date(effective_signal))
+        )
         if float(metrics.get("amount_yi") or 0) < min_amount_yi:
             continue
 
@@ -969,14 +974,6 @@ def rank_on_signal_date(
         if allowed_stages is not None and stage[0] not in allowed_stages:
             continue
 
-        score = calc_auto_score(
-            metrics,
-            stage[0],
-            bench_pct,
-            is_qdii=cfg.get("is_qdii", False),
-            premium_pct=cfg.get("premium_pct"),
-            consecutive_strong=strong_days,
-        )
         ranked.append({
             "direction": direction,
             "etf_code": cfg["code"],
@@ -985,13 +982,15 @@ def rank_on_signal_date(
             "industry": cfg["ind"],
             "product_type": cfg.get("type", "ETF"),
             "is_qdii": cfg.get("is_qdii", False),
+            "premium_pct": cfg.get("premium_pct"),
             "metrics": metrics,
             "stage": stage,
             "strong_days": strong_days,
-            "score": score,
+            "score": {},
             "signal_date": _fmt_date(effective_signal),
         })
 
+    apply_scoring_context(ranked, bench_pct)
     return sorted(ranked, key=_rank_key, reverse=True)
 
 
@@ -1006,9 +1005,10 @@ def run_backtest(
     offline: bool = False,
     one_way_cost_bps: float = ONE_WAY_COST_BPS,
     stop_slippage_bps: float = STOP_SLIPPAGE_BPS,
+    min_hold_trading_days: int = MIN_HOLD_TRADING_DAYS,
 ) -> pd.DataFrame:
-    if top_n != TARGET_SELECTION_COUNT:
-        raise ValueError(f"正式组合固定选择 {TARGET_SELECTION_COUNT} 只标的，不能使用 top_n={top_n}")
+    if top_n < 1 or top_n > TARGET_SELECTION_COUNT:
+        raise ValueError(f"top_n 必须在 1-{TARGET_SELECTION_COUNT} 之间，实际为 {top_n}")
     etf_pool = load_etf_txt()
     if max_etfs:
         full_pool = etf_pool
@@ -1141,37 +1141,43 @@ def run_backtest(
             r for r in ranked_all
             if r["stage"][0] in NEW_MONEY_STAGES
             and _new_position_allowed(r, market_state)
-            and float(r.get("score", {}).get("total") or 0) >= MIN_ENTRY_SCORE
-        ]
-        primary_codes = {r["etf_code"] for r in new_ranked}
-        fallback_ranked = [
-            r for r in ranked_all
-            if r["etf_code"] not in primary_codes
-            and _fallback_position_allowed(r, market_state)
-        ]
-        fallback_codes = primary_codes | {r["etf_code"] for r in fallback_ranked}
-        defensive_ranked = [
-            r for r in ranked_all
-            if r["etf_code"] not in fallback_codes
-            and not (r.get("is_qdii") and not _is_commodity_like(r))
-            and not _is_chase_high(r, market_state)
         ]
         carry_candidates = []
         sold_notes = []
         for previous in holdings.values():
-            keep, reason, current = _should_hold_position(previous, ranked_by_code, data, signal_date)
+            keep, reason, current = _should_hold_position(
+                previous,
+                ranked_by_code,
+                data,
+                signal_date,
+                market_state,
+            )
             if keep and current is not None:
+                held_days = _trading_days_held(
+                    data[current["etf_code"]],
+                    previous.get("holding_since"),
+                    signal_date,
+                )
+                minimum_hold_protected = (
+                    freq == "weekly"
+                    and held_days < min_hold_trading_days
+                )
                 carry_candidates.append({
                     **current,
                     "entry_type": "续持",
                     "entry_tier": "持有",
-                    "hold_reason": reason,
+                    "hold_reason": (
+                        f"{reason}；最短持有期保护{held_days}/{min_hold_trading_days}日"
+                        if minimum_hold_protected
+                        else reason
+                    ),
                     "holding_since": previous.get("holding_since") or current.get("signal_date"),
                     "carry_price": previous.get("mark_price"),
                     "peak_score": max(
                         float(previous.get("peak_score") or 0),
                         float(current.get("score", {}).get("total") or 0),
                     ),
+                    "minimum_hold_protected": minimum_hold_protected,
                 })
             else:
                 sold_notes.append(f"{previous['etf_name']}({reason})")
@@ -1192,44 +1198,17 @@ def run_backtest(
             })
             selected_codes.add(r["etf_code"])
 
-        for r in fallback_ranked:
-            if r["etf_code"] in selected_codes:
-                continue
-            candidate_pool.append({
-                **r,
-                "entry_type": "补位",
-                "entry_tier": "补位",
-                "hold_reason": "强信号不足三只，按池内质量门禁补位",
-                "holding_since": _fmt_date(entry_date),
-                "carry_price": None,
-                "peak_score": float(r.get("score", {}).get("total") or 0),
-            })
-            selected_codes.add(r["etf_code"])
-
-        for r in defensive_ranked:
-            if r["etf_code"] in selected_codes:
-                continue
-            candidate_pool.append({
-                **r,
-                "entry_type": "防守补位",
-                "entry_tier": "防守补位",
-                "hold_reason": "核心与常规补位不足三只，按固定池防守优先补位",
-                "holding_since": _fmt_date(entry_date),
-                "carry_price": None,
-                "peak_score": float(r.get("score", {}).get("total") or 0),
-            })
-            selected_codes.add(r["etf_code"])
-
         selected = _select_top_candidates(
             candidate_pool,
             top_n,
             freq,
             market_state,
         )
-        if len(selected) < TARGET_SELECTION_COUNT:
+        state_max = max_selection_count(market_state)
+        if len(selected) < state_max:
             print(
-                f"  {label}: 数据/分散约束后仅 {len(selected)} 只，"
-                "该周期不满足正式三标的口径",
+                f"  {label}: 三层门禁和分散约束后选择 {len(selected)}/{state_max} 只，"
+                "剩余风险预算保留现金",
                 flush=True,
             )
         selected_codes = {r["etf_code"] for r in selected}
@@ -1303,10 +1282,10 @@ def run_backtest(
             continue
 
         selected = realized_selected
-        # 唯一仓位口径：三只按40%/35%/25%的强弱结构分配市场目标仓位。
-        # 标的不足时保留对应缺口为现金，不把弱候选或单腿机械放大。
+        # 排名比例按实际通过门禁的标的数量归一化后分配风险预算。
+        # QDII/LOF 继续受产品上限约束，所有未使用预算均保留现金。
         n_legs = len(selected)
-        rank_weights_pct = allocate_ranked_weights(market_state, n_legs)
+        rank_weights_pct = allocate_instrument_weights(market_state, selected)
         weights = [weight / 100 for weight in rank_weights_pct]
 
         weighted_sum = 0.0
@@ -1370,11 +1349,17 @@ def run_backtest(
                 holdings.get(code, {}),
             )
             simulation = item.get("simulation")
-            execution_price = (
-                float(simulation.entry_price)
-                if simulation is not None and delta > 0
-                else float(item.get("mark_price") or 0.0)
-            )
+            if simulation is not None and delta > 0:
+                execution_price = float(simulation.entry_price)
+            elif delta < 0 and code in data:
+                execution_row = _last_row_on_or_before(data[code], entry_date)
+                execution_price = (
+                    float(execution_row["open"])
+                    if execution_row is not None
+                    else float(item.get("mark_price") or 0.0)
+                )
+            else:
+                execution_price = float(item.get("mark_price") or 0.0)
             trade_records.append({
                 "date": _fmt_date(entry_date),
                 "period": label,
@@ -1404,13 +1389,6 @@ def run_backtest(
         ) or "无负贡献标的"
 
         risk_flags = []
-        fallback_count = sum(
-            1
-            for r in selected
-            if r.get("entry_tier") in {"补位", "防守补位"}
-        )
-        if fallback_count:
-            risk_flags.append(f"{fallback_count}只补位标的")
         if len(stopped_codes) >= 2:
             risk_flags.append(f"{len(stopped_codes)}只标的同周止损")
         category_counts: dict[str, int] = {}
@@ -1512,6 +1490,7 @@ def run_backtest(
         empty.attrs["max_etfs"] = max_etfs
         empty.attrs["freq"] = freq
         empty.attrs["effective_min_amount_yi"] = effective_min_amount_yi
+        empty.attrs["min_hold_trading_days"] = int(min_hold_trading_days)
         empty.attrs["weekly_max_broad"] = WEEKLY_MAX_BROAD if freq == "weekly" else None
         return empty
 
@@ -1531,6 +1510,7 @@ def run_backtest(
     df.attrs["max_etfs"] = max_etfs
     df.attrs["freq"] = freq
     df.attrs["effective_min_amount_yi"] = effective_min_amount_yi
+    df.attrs["min_hold_trading_days"] = int(min_hold_trading_days)
     df.attrs["weekly_max_broad"] = WEEKLY_MAX_BROAD if freq == "weekly" else None
     df.attrs["one_way_cost_bps"] = float(one_way_cost_bps)
     df.attrs["stop_slippage_bps"] = float(stop_slippage_bps)
@@ -1674,6 +1654,9 @@ def write_report(
             "offline": bool(df.attrs.get("offline", False)),
             "one_way_cost_bps": active_cost_bps,
             "stop_slippage_bps": active_slippage_bps,
+            "min_hold_trading_days": int(
+                df.attrs.get("min_hold_trading_days", MIN_HOLD_TRADING_DAYS)
+            ),
         },
         "universe_quality": universe_quality,
         "universe_file_sha256": _file_sha256(SCRIPT_DIR / "etf_universe_history.csv")
@@ -1694,11 +1677,15 @@ def write_report(
     hold_bonus_label = "周度" if freq == "weekly" else "月度"
     hold_bonus = HOLD_BONUS.get(freq, HOLD_BONUS["monthly"])
     policy_compliant = (
-        (df["selection_count"] == TARGET_SELECTION_COUNT)
+        (df["selection_count"] >= 0)
         & df.apply(
-            lambda row: abs(
-                float(row["exposure"]) - float(get_target_exposure(row["market_state"]))
-            ) < 0.1,
+            lambda row: int(row["selection_count"]) <= max_selection_count(row["market_state"]),
+            axis=1,
+        )
+        & df.apply(
+            lambda row: 0 <= float(row["exposure"]) <= float(
+                get_target_exposure(row["market_state"])
+            ) + 0.1,
             axis=1,
         )
     )
@@ -1807,15 +1794,25 @@ def write_report(
         "- 新仓按周期第一个交易日开盘成交；续持仓沿用上一周期收盘标记价，保留周末和节假日跳空收益。",
         "- 第 t 日止损价只使用 t-1 日以前的峰值；盘中触发按止损价减滑点成交，跳空跌破则按开盘价减滑点成交。",
         "- 单标的单日跌幅达到7%或同风险簇至少3个细分方向单日跌超5%，在下一交易日开盘执行日度风控退出，当周不换入新标的。",
-        "- 市场目标仓位统一为：主升100%、震荡90%、退潮70%、退潮末期60%、冰点40%。",
-        "- 每期固定三只标的，按排名分配目标仓位的40%/35%/25%。",
+        "- 市场风险预算范围为：主升80-100%、震荡70-100%、退潮60-90%、退潮末期/未知60-80%、冰点0-40%。",
+        "- 每期允许0–3只；主升最多3只、震荡/退潮最多2只、退潮末期/冰点最多1只，不以低质量候选补位。",
+        "- 排名比例按实际合格数量归一化：一只使用全部风险预算，两只按40:35，三只按40:35:25；冰点允许空仓。",
+        "- 跨境/QDII允许入选；溢价未知时评分降权且仓位上限15%，溢价可核验且正常时上限25%。",
         f"- 所有仓位变化计入单边 {active_cost_bps:g}bp 交易成本；止损成交另计 {active_slippage_bps:g}bp 滑点。",
         "- 不使用当月已实现收益排序，避免未来函数。",
         "- 商品/资源/LOF 使用更宽的趋势止损，避免强主升浪中被普通行业 ETF 阈值过早洗出。",
         f"- 防守市场追高硬门禁：单日 >{CHASE_SINGLE_DAY_LIMIT:g}% 或 5日 >{CHASE_5D_RETURN_LIMIT:g}% → 不新开仓。",
-        f"- 核心门槛 {MIN_ENTRY_SCORE:g} 分，常规补位门槛 {FALLBACK_ENTRY_SCORE:g} 分；不足三只时按固定池防守优先补位。",
+        (
+            f"- 新仓折溢价前总分必须≥{CORE_ENTRY_SCORE:.0f}，"
+            f"5日正收益的最大单日贡献必须≤{MAX_NEW_POSITION_ONE_DAY_DOMINANCE:.0%}；"
+            "主线强度、买点质量和风险惩罚仍须分别过门槛。"
+        ),
+        (
+            f"- 健康旧仓在前{int(df.attrs.get('min_hold_trading_days', MIN_HOLD_TRADING_DAYS))}"
+            "个交易日内获得替换保护；止损、主线失效和风险惩罚超限仍立即退出。"
+        ),
         "- 非防守新仓若60日趋势为负，必须同时达到60分和20日涨幅15%的强反转门槛。",
-        f"- 震荡/退潮周度组合最多新开 {MAX_SAME_RISK_CLUSTER} 只同风险簇标的；主升期或合格旧强仓不机械去相关。",
+        f"- 主升/震荡最多持有 {MAX_SAME_RISK_CLUSTER} 只同风险簇标的；退潮及更弱状态最多1只，续持仓同样计入。",
         "",
         "## 参数",
         "",
@@ -1823,6 +1820,9 @@ def write_report(
         f"- 命令最低成交额：{min_amount_yi} 亿",
         f"- 实际最低成交额：{effective_min_amount_yi} 亿",
         f"- 可续持阶段：{', '.join(sorted(HOLDABLE_STAGES))}",
+        f"- 新仓折溢价前总分下限：{CORE_ENTRY_SCORE:.0f}",
+        f"- 新仓5日正收益最大单日贡献：{MAX_NEW_POSITION_ONE_DAY_DOMINANCE:.0%}",
+        f"- 周度最短持有保护：{int(df.attrs.get('min_hold_trading_days', MIN_HOLD_TRADING_DAYS))} 个交易日",
         f"- {hold_bonus_label}续持溢价：弱续持 +{hold_bonus['weak']:.0f}，正常续持 +{hold_bonus['normal']:.0f}，强续持 +{hold_bonus['strong']:.0f}",
         f"- 普通趋势止损：高点回撤 {abs(NORMAL_TRAIL_STOP):.0f}% 且跌破 MA20",
         f"- 商品/LOF 趋势止损：高点回撤 {abs(COMMODITY_TRAIL_STOP):.0f}% 且跌破 MA20",
@@ -1842,7 +1842,7 @@ def write_report(
         f"- 日度夏普：{daily_sharpe:.2f}",
         f"- 最大回撤（日度权益）：{max_drawdown:.2f}%",
         f"- 平均仓位：{df['exposure'].mean():.1f}%",
-        f"- 三标的与目标仓位合规率：{policy_compliant.mean() * 100:.1f}%",
+        f"- 0–3标的与仓位上限合规率：{policy_compliant.mean() * 100:.1f}%",
         f"- 累计单边换手：{df['turnover_pct'].sum() / 100:.2f} 倍",
         f"- 累计成本影响：{df['cost_pct'].sum():.2f} 个百分点（逐期近似和）",
         "",
@@ -1867,7 +1867,7 @@ def main():
     parser = argparse.ArgumentParser(description="ETF 三层分析框架无未来函数回测")
     parser.add_argument("--start", default="2025-01-01", help="起始日期")
     parser.add_argument("--end", default=pd.Timestamp.today().strftime("%Y-%m-%d"), help="结束日期")
-    parser.add_argument("--top", type=int, default=TARGET_SELECTION_COUNT, help="固定为3，仅保留参数用于兼容旧命令")
+    parser.add_argument("--top", type=int, default=TARGET_SELECTION_COUNT, help="每期最多持有数量（1-3，默认3）")
     parser.add_argument("--min-amount-yi", type=float, default=0.2, help="最低成交额，单位亿元")
     parser.add_argument("--max-etfs", type=int, default=None, help="调试用：仅回测前 N 只 ETF/LOF")
     parser.add_argument("--freq", choices=["monthly", "weekly"], default="weekly", help="调仓频率")
@@ -1880,6 +1880,12 @@ def main():
         type=float,
         default=STOP_SLIPPAGE_BPS,
         help="止损成交额外滑点，bp",
+    )
+    parser.add_argument(
+        "--min-hold-days",
+        type=int,
+        default=MIN_HOLD_TRADING_DAYS,
+        help="健康旧仓的最短持有保护交易日数；0用于消融对照",
     )
     args = parser.parse_args()
 
@@ -1894,6 +1900,7 @@ def main():
         offline=args.offline,
         one_way_cost_bps=args.cost_bps,
         stop_slippage_bps=args.stop_slippage_bps,
+        min_hold_trading_days=args.min_hold_days,
     )
     out_path = write_report(
         df,

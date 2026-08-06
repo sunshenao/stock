@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "phase": "intraday",
+  "date": "YYYY-MM-DD",
+  "as_of": "YYYY-MM-DD 14:00",
+  "strategy_version": "2.5.5",
+  "data_quality": "pass",
+  "completed_checks": [],
+  "facts": {
+    "hard_risk_triggered": false,
+    "notes": []
+  },
+  "decision": {
+    "action": "observe",
+    "codes": [],
+    "reason_codes": [],
+    "decision_contract": "",
+    "authorization": {
+      "kind": "",
+      "id": "",
+      "authorized_at": "",
+      "action": "",
+      "codes": [],
+      "reason_codes": []
+    }
+  },
+  "parameter_changes": []
+}

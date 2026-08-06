@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "as_of": "YYYY-MM-DD HH:MM",
+  "confirmed": false,
+  "confirmed_by": "",
+  "cash_pct": 100.0,
+  "positions": []
+}

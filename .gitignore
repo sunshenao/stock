@@ -7,3 +7,5 @@ breadth.json
 etf_rank_p*.json
 codex/stock/.cache/
 .claude/settings.local.json
+check/*.log
+.venv-easytrader

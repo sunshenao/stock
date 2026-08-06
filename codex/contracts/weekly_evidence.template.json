@@ -1,0 +1,30 @@
+{
+  "schema_version": 2,
+  "data_cutoff": "YYYY-MM-DD 15:00",
+  "news_cutoff": "YYYY-MM-DD HH:MM",
+  "approval": {
+    "kind": "user",
+    "id": "USER_CONFIRMED",
+    "approved_at": "YYYY-MM-DD HH:MM"
+  },
+  "items": [
+    {
+      "code": "000000",
+      "status": "approved",
+      "thesis": "只描述可证伪的投资假设，不参与评分或排序。",
+      "invalidation": "写明事件和价格的失效条件。",
+      "catalyst": {
+        "title": "待发生事件",
+        "known_at": "YYYY-MM-DD HH:MM",
+        "event_date": "YYYY-MM-DD HH:MM",
+        "source_name": "官方或可追溯来源",
+        "source_url": "https://example.com/source"
+      }
+    },
+    {
+      "code": "000001",
+      "status": "rejected",
+      "rejection_reason": "证据不足或风险否决"
+    }
+  ]
+}

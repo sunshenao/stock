@@ -1,4 +1,0 @@
-﻿fold,train_start,train_end,test_start,test_end,test_periods,complete_fold,return_pct,benchmark_pct,excess_pct,win_rate_pct,max_daily_drawdown_pct,parameter_changes
-1,2025-06-03,2025-11-28,2025-12-01,2026-03-06,13,True,8.06,0.68,7.37,53.8,-11.45,0
-2,2025-06-03,2026-03-06,2026-03-09,2026-06-05,13,True,3.52,3.76,-0.25,61.5,-10.18,0
-3,2025-06-03,2026-06-05,2026-06-08,2026-06-30,4,False,16.73,3.64,13.1,100.0,-3.33,0

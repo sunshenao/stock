@@ -1,27 +1,29 @@
 {
   "schema_version": 1,
-  "strategy_version": "2.0.1",
-  "strategy_sha256": "319ed2b7cfd83a8634a67b06285b30ee1520a7c24ca2f537415638708fb56d10",
+  "strategy_version": "2.5.7",
+  "strategy_sha256": "39940d6315cd214a507ef615fa3432f894ea7982f9b1031abb595901a5bd33db",
   "strategy_integrity": true,
   "strategy_integrity_errors": [],
-  "sample_classification": "历史回放（非样本外）",
+  "sample_classification": "历史回放与冻结后前向记录混合",
   "forward_start": "2026-07-27",
-  "forward_observed_trading_days": 0,
+  "forward_observed_trading_days": 5,
   "minimum_forward_weeks": 26,
   "parameters": {
-    "start": "2026-05-01",
-    "end": "2026-07-25",
+    "start": "2025-08-04",
+    "end": "2026-08-01",
     "frequency": "weekly",
     "top_n": 3,
     "minimum_amount_yi": 0.2,
+    "offline": false,
     "one_way_cost_bps": 8.0,
-    "stop_slippage_bps": 10.0
+    "stop_slippage_bps": 10.0,
+    "min_hold_trading_days": 10
   },
   "universe_quality": "partial",
   "universe_file_sha256": "906f5055c619df9edf0d286dc1c77aca01c42d35b1b8b82c28d1f1184689350d",
   "artifacts": {
-    "backtest_result_weekly_daily_equity.csv": "322bbb5461bfa440b9395ad81810ab57dc64583486c405ef7aebbf8c81508503",
-    "backtest_result_weekly_positions.csv": "97b7804965692685cfb8f698dec63e6ebc2fc2ed46035eaab8713830d4f25602",
-    "backtest_result_weekly_trades.csv": "0769df8d9dd0ae065f30b0c566d41f7f7953ec4c2af6026a2e1433981f3384ec"
+    "backtest_result_weekly_daily_equity.csv": "d2c2281f566607e793490f32d12375c2398b9f56113ffd9ee7e0d0d46cfeb4da",
+    "backtest_result_weekly_positions.csv": "43b2a8a8a47cab4b1015046a034895e699fafa0c1796ec0e637b4e2ab9f3861d",
+    "backtest_result_weekly_trades.csv": "c6dbec13fe99b1cbc8a4814cc2fedf5d4d5a58e263c09bb04f5b3eac926a2765"
   }
 }

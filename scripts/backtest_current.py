@@ -27,8 +27,10 @@ from pathlib import Path
 from market_state import classify_market_state
 from risk_rules import (
     TARGET_SELECTION_COUNT,
+    allocate_instrument_weights,
     allocate_ranked_weights,
     get_target_exposure,
+    max_selection_count,
 )
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -275,14 +277,32 @@ def _pick_ranked(
     return selected
 
 
-def _scaled_rank_weights(market_state: str, target_exposure: float, count: int) -> list[float]:
+def _scaled_rank_weights(
+    market_state: str,
+    target_exposure: float,
+    count: int,
+    instruments: list[ETFData] | None = None,
+) -> list[float]:
     standard = get_target_exposure(market_state)
-    weights = allocate_ranked_weights(market_state, count)
+    if instruments is None:
+        weights = allocate_ranked_weights(market_state, count)
+    else:
+        weights = allocate_instrument_weights(
+            market_state,
+            [
+                {
+                    "product_type": "ETF",
+                    "is_qdii": row.is_qdii,
+                    "premium_pct": None,
+                }
+                for row in instruments[:count]
+            ],
+        )
     if standard <= 0 or not weights:
         return []
     scale = target_exposure / standard
     scaled = [round(weight * scale, 1) for weight in weights]
-    if count == TARGET_SELECTION_COUNT:
+    if abs(sum(weights) - standard) <= 0.05:
         scaled[-1] = round(target_exposure - sum(scaled[:-1]), 1)
     return scaled
 
@@ -516,6 +536,7 @@ def run_backtest(scans, prices, dates, opens=None, verbose=True):
             )
         ]
 
+        state_selection_limit = max_selection_count(market_state)
         if has_scan and (is_rebalance or not holdings):
             candidate_by_code = {row.code: row for row in eligible}
             for code in holdings:
@@ -533,7 +554,7 @@ def run_backtest(scans, prices, dates, opens=None, verbose=True):
                     candidate_by_code[code] = current
             selected = _pick_ranked(
                 list(candidate_by_code.values()),
-                TARGET_SELECTION_COUNT,
+                state_selection_limit,
                 preferred_codes=set(holdings),
             )
             selected_codes = {row.code for row in selected}
@@ -553,7 +574,7 @@ def run_backtest(scans, prices, dates, opens=None, verbose=True):
                         "missing_days": 0,
                     }
                 holdings[row.code]["rank"] = rank
-        elif has_scan and len(holdings) < TARGET_SELECTION_COUNT:
+        elif has_scan and len(holdings) < state_selection_limit:
             used_codes = set(holdings)
             major_count: dict[str, int] = {}
             for item in holdings.values():
@@ -577,7 +598,7 @@ def run_backtest(scans, prices, dates, opens=None, verbose=True):
                 }
                 used_codes.add(row.code)
                 major_count[major] = major_count.get(major, 0) + 1
-                if len(holdings) >= TARGET_SELECTION_COUNT:
+                if len(holdings) >= state_selection_limit:
                     break
 
         # 市场状态变化或持仓变化后必须立刻重算总仓位，禁止残留旧档位。
@@ -587,11 +608,16 @@ def run_backtest(scans, prices, dates, opens=None, verbose=True):
                 holdings[code].get("rank", 99),
                 -row_by_code.get(code, ETFData()).score,
             ),
-        )[:TARGET_SELECTION_COUNT]
+        )[:state_selection_limit]
         for code in list(holdings):
             if code not in ordered_codes:
                 del holdings[code]
-        new_weights = _scaled_rank_weights(market_state, target_pos, len(ordered_codes))
+        new_weights = _scaled_rank_weights(
+            market_state,
+            target_pos,
+            len(ordered_codes),
+            [row_by_code.get(code, ETFData(code=code)) for code in ordered_codes],
+        )
         for code, weight in zip(ordered_codes, new_weights):
             holdings[code]["w"] = weight
 

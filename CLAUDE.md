@@ -1,98 +1,43 @@
-# A股ETF轮动执行规则
+# 项目协作约束
 
-目标是在无未来函数、流动性、回撤和交易成本约束下，提高滚动样本外复利收益。正式预测只使用 `scripts/etf.txt` 中的ETF/LOF。
+开始修改前先阅读：
 
-## 唯一来源
+1. `README.md`：项目结构、命令和目录纪律。
+2. `DAILY_RUNBOOK.md`：盘前、盘后和周末的执行顺序。
+3. `codex/stock_selection_logic.md`：正式策略的唯一文字规则。
+4. `codex/strategy_versions/current.json`：当前冻结版本。
+5. `codex/contracts/README.md`：模型权限、批准主体和失败关闭规则。
 
-- 标的池：`scripts/etf.txt`，模型不得自行增删。
-- 仓位政策：`scripts/risk_rules.py`。
-- 选股方法：`codex/stock_selection_logic.md`。
-- 实际持仓：`codex/stock/current_positions.md`，只有用户确认成交后才能改为“持有”。
+必须遵守以下约束：
 
-## 三种频率
+- 正式标的只能来自 `scripts/etf.txt`，历史回放同时受 `scripts/etf_universe_history.csv` 约束。
+- 正式组合允许0至3只，不得为了凑数降低门槛；无合格标的允许空仓。
+- QDII/跨境产品不得因分类直接排除，只能按折溢价、流动性和仓位上限控制。
+- 月度只提供方向背景，周度是唯一常规换仓频率，日度只处理硬退出或系统性降仓。
+- 盘中审查只做风险预警，不得按盘中排名换票；人工紧急处置必须与规则策略收益分开记录。
+- 历史信号只使用当时可得数据，成交使用下一交易日开盘，并计入成本和止损滑点。
+- 用户观点、当前热点或旧持仓不能自动加分。
+- 改动正式信号、仓位、执行、数据或标的池后必须运行测试，并创建新的策略版本；不得修改已冻结版本来拼接前向业绩。
+- 历史回测、滚动切片和参数扰动都不是冻结后的真实样本外证据。
+- `codex/stock/current_positions.md` 只有在用户确认实际成交后才能更新。
+- `codex/stock/account_state.json` 是账户级订单的唯一结构化事实源；未确认时必须阻断订单，不得猜测。
+- 模型只能起草证据摘要和解释，不得改扫描器候选、排名、仓位、执行价格或订单。
+- `scan.json` 的实际行情截止日、策略哈希、正式候选和仓位是机器权威输入；目录日期和模型文字不得覆盖。
+- `weekly_evidence.json` 必须由 `user`、`rules_engine` 或 `data_connector` 批准；模型不能自批。
+- 正式周度结果只能由 `decision_contract.py` 生成；模型手写的 `selection.md` 不具备执行权限。
+- 所有会取消、减仓、退出或盘中紧急成交的运行操作都必须携带与动作、代码和原因完全一致的非模型授权。
+- 输入缺失、数据质量失败、哈希变化或授权不匹配时一律 fail closed，不得用自然语言补齐。
 
-| 频率 | 职责 | 可否换标的 | 输出 |
-|---|---|---|---|
-| 月度 | 判断未来1至3个月产业方向、政策和景气 | 否 | `monthly_review.md` |
-| 周度 | 全池排名、选择3只、确定目标仓位 | 是，唯一正式频率 | `selection.md` |
-| 日度 | 逐仓止损、催化证伪、冰点和大簇崩盘检查 | 仅硬退出/降仓 | `risk_review.md` |
-
-正式周度方案在周末或本周最后交易日盘后生成，下一交易日开盘执行。日度排名变化本身不是换仓理由。
-
-## 硬约束
-
-1. 正式组合固定3只不同标的，全部来自 `scripts/etf.txt`，按强弱分配不同仓位。
-2. 震荡、退潮及未知状态最多新开2只同一风险簇；主升期可集中到3只，合格旧强仓不机械卖出。普通ETF上限40%、LOF上限35%、QDII上限25%，单一方向不超过60%。
-3. 除冰点外现金不超过40%。没有3只合格标的时只能输出观察草稿。
-4. 大于10%的新仓必须有待发生催化、失效条件、止损、目标和至少1.8:1的预期盈亏比。
-5. 单日涨幅超过7%、5日超过25%或20日超过35%的标的默认不新开。
-6. 信号只能使用当时可获得的数据，成交使用下一交易日开盘；交易和调仓按单边8bp计费。
-7. 用户观点、旧持仓和上周主线只作为待验证假设，不自动加分。
-8. 非防守新仓若60日趋势为负，必须同时满足总分不低于60、20日涨幅不低于15%的强反转条件；补位仓不把该条件当成绝对禁令。
-9. 国际利好只能验证已有价格信号，不能创造买点；国际利空可否决或降级。全局红色需两个独立来源，或官方/系统性硬事件。
-10. 核心新仓评分不得低于45，固定池补位不得低于30；两个门槛统一定义在 `risk_rules.py`，扫描器和回测不得各写一套。
-
-## 标准流程
+常用入口：
 
 ```powershell
-# 月度方向复核
-python scripts/workflow.py --mode monthly --date YYYY-MM-DD
-
-# 周度正式选股
 python scripts/workflow.py --mode weekly --date YYYY-MM-DD
-python scripts/selection_guard.py codex/stock/YYYY-MM-DD/selection.md
-
-# 日度风险复核
-python scripts/workflow.py --mode daily --date YYYY-MM-DD
+python scripts/decision_contract.py build --date YYYY-MM-DD --evidence codex/stock/YYYY-MM-DD/weekly_evidence.json --account-state codex/stock/account_state.json
+python scripts/decision_contract.py verify codex/stock/YYYY-MM-DD/decision.json
+python scripts/selection_guard.py codex/stock/YYYY-MM-DD/selection.generated.md
+python scripts/ops_contract.py verify codex/stock/YYYY-MM-DD/intraday_packet.json
+python scripts/backtest.py --freq weekly --start YYYY-MM-DD --end YYYY-MM-DD --offline
+python scripts/robustness_validate.py --offline
+python scripts/test_strategy_framework.py -v
+python scripts/test_model_independence.py -v
 ```
-
-已有同日扫描时可加 `--reuse-scan`。扫描必须覆盖完整固定池，池外热门标的只能作为验证，不能进入候选或组合。
-
-周末生成下周方案时，用 `--news-cutoff YYYY-MM-DDTHH:MM` 把国际事件复核推进到实际生成时点；历史复盘不传该参数，默认停在目标日23:59，防止未来新闻回填。
-
-`workflow.py --mode daily` 会读取 `current_positions.md` 中用户已确认的实际持仓；没有实际持仓时，才回退到近8日内通过校验的周度模型组合。两者都没有时必须报告“无可核验持仓”，不得虚构止损或换仓。
-
-`workflow.py --mode weekly` 只有在同目录存在且通过 `selection_guard.py` 的 `selection.md` 时才算完成。只有 `etf_scan.md` 会以非零状态退出，防止把全池扫描误报成正式周选股。
-
-## 周度方案必填
-
-`selection.md` 必须包含：
-
-- `调仓频率：周度`、数据截止时间和市场状态。
-- 热门方向全局比较以及主要落选反证。
-- 3只标的、不同仓位、成交额、待发生催化、买入区间、止损、目标和盈亏比。
-- 旧持仓保留或退出理由、现金比例和下次常规重排日期。
-- `event_risk.md` 的新闻截止时间、风险级别、有效事件和对组合的实际影响。
-- 明确填写“国际事件动作”；红色环境下不得新开高弹性风险簇。
-
-未通过 `selection_guard.py` 的文件不可执行。
-
-## 日度硬退出
-
-仅以下情况允许日度改变周度组合：
-
-- 催化或业绩逻辑被公告证伪。
-- 触发预设结构止损、ATR止损或移动止损。
-- 市场进入冰点，需要降低总仓位。
-- 同一大类至少3个独立细分方向单日跌超5%。
-- 标的连续失去流动性或出现不可交易风险。
-- 国际风险簇已被多源否决，且持仓价格或资金同步走弱；单一标题或单纯利好不触发卖出。
-
-未触发时写“延续周度组合”，不得重新选3只。
-
-## 国际事件层
-
-- 时点台账：`codex/stock/event_ledger.csv`；每条必须记录可知时间、范围、方向、有效期、来源和链接。
-- 标准输出：每次工作流同时生成 `event_risk.md`，未来新闻不会回填到过去日期。
-- 交叉验证：单一普通媒体的全局利空最多判黄色；红色要求两个独立来源，官方紧急政策、战争升级或市场中断等硬事件例外。
-- 执行顺序：先由价格和资金形成周度候选，再用事件层验证或否决；严禁根据新闻标题直接买入。
-- 回测边界：没有完整历史时点新闻库时，历史回测不使用当前新闻，避免未来函数。
-
-## 验证
-
-- 主回测：`python scripts/backtest.py --freq weekly --start YYYY-MM-DD --end YYYY-MM-DD`
-- 月度只做敏感性对照：`python scripts/backtest.py --freq monthly ...`
-- 日度快照诊断：`python scripts/backtest_current.py --days full`
-- 回归测试：`python scripts/test_strategy_framework.py -v`
-
-比较收益时同时报告超额、最大回撤、换手、成本和样本外稳定性，不用单一月份决定规则。

@@ -22,10 +22,16 @@ STRATEGY_FILES = (
     "scripts/backtest_current.py",
     "scripts/workflow.py",
     "scripts/selection_guard.py",
+    "scripts/decision_contract.py",
+    "scripts/ops_contract.py",
     "scripts/universe_history.py",
     "scripts/etf.txt",
     "scripts/etf_universe_history.csv",
     "codex/stock_selection_logic.md",
+    "codex/contracts/weekly_evidence.template.json",
+    "codex/contracts/account_state.template.json",
+    "codex/contracts/ops_packet.template.json",
+    "codex/contracts/weekly_review_packet.template.json",
 )
 
 

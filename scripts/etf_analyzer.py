@@ -27,18 +27,21 @@ PROJECT_ROOT = SCRIPT_DIR.parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from risk_rules import (
-    CORE_ENTRY_SCORE,
-    FALLBACK_ENTRY_SCORE,
-    MAX_SAME_RISK_CLUSTER,
-    allocate_ranked_weights,
+    MAX_NEW_POSITION_ONE_DAY_DOMINANCE,
+    allocate_instrument_weights,
+    category_root,
     get_position_cap,
+    max_same_risk_cluster,
+    max_selection_count,
     new_position_trend_gate,
     premium_discount_factor,
     risk_cluster,
+    score_layers_pass,
 )
 from market_state import classify_market_state
 from market_data_cache import adjust_price_discontinuities, load_history
 from skill_paths import find_hithink_cli, find_skill_scripts
+from strategy_version import load_current_manifest, verify_manifest
 
 # Stock-analyzer-skill 路径（兼容 .claude/.codex/npm 全局安装）
 SKILL_SCRIPTS = find_skill_scripts("stock-analyzer-skill")
@@ -127,7 +130,7 @@ def _infer_product_type(name: str, category: str) -> str:
 
 
 def _is_cross_border_or_qdii(name: str, category: str) -> bool:
-    if category == "跨境":
+    if str(category).startswith("跨境"):
         return True
     qdii_words = (
         "港", "美", "纳指", "标普", "日经", "德国", "法国", "沙特",
@@ -282,7 +285,13 @@ def _market_note(state: str, up_ratio: float) -> str:
     elif state == "震荡":
         return "市场分歧，优先保留主线仓位，弹性仓不追高"
     elif state == "退潮":
+        if up_ratio >= 2.0:
+            return "市场宽度强修复，但基准尚未收复中期趋势；按反弹确认期处理，不把单日普涨直接判为主升"
         return "赚钱效应弱，ETF 排名只作候选；不强制三标的，允许高现金等待主力确认"
+    elif state == "退潮末期":
+        if up_ratio >= 2.0:
+            return "超跌后的宽度修复正在发生，中期趋势仍弱；等待连续性和主线强度共同确认"
+        return "中期趋势处于退潮末期，只保留最强方向并等待宽度修复"
     elif state == "冰点":
         return "极度恐慌，以现金为主，只保留最强方向的试探仓"
     else:
@@ -558,22 +567,23 @@ def calc_etf_metrics(df: pd.DataFrame, target_date: str) -> dict:
         today = fallback.iloc[-1:]
         actual_date = td.strftime("%Y-%m-%d")
     today = today.iloc[0]
+    known = df[df["date"] <= td].sort_values("date").copy()
     stale_days = max(0, (target_ts - td).days)
     is_stale = stale_days > 0 and target_ts <= pd.Timestamp.today().normalize()
     close_today = today["close"]
     volume_today = float(today.get("volume", 0) or 0)
     amount_today = float(today.get("amount", 0) or 0)
 
-    past_5 = df[df["date"] <= td].tail(6)
-    past_20 = df[df["date"] <= td].tail(21)
-    last_5 = df[df["date"] <= td].tail(5)
+    past_5 = known.tail(6)
+    past_20 = known.tail(21)
+    last_5 = known.tail(5)
 
     ret_5d = (close_today / past_5.iloc[0]["close"] - 1) * 100 if len(past_5) >= 2 else None
     ret_20d = (close_today / past_20.iloc[0]["close"] - 1) * 100 if len(past_20) >= 2 else None
 
     # 5日动量加速度：最近5日涨跌 - 前一个5日涨跌
     if len(past_5) >= 6 and ret_5d is not None:
-        prev_5 = df[df["date"] <= past_5.iloc[0]["date"]].tail(6)
+        prev_5 = known[known["date"] <= past_5.iloc[0]["date"]].tail(6)
         if len(prev_5) >= 2:
             prev_ret_5 = (past_5.iloc[0]["close"] / prev_5.iloc[0]["close"] - 1) * 100
             accel_5d = round(ret_5d - prev_ret_5, 1)
@@ -589,23 +599,67 @@ def calc_etf_metrics(df: pd.DataFrame, target_date: str) -> dict:
 
     pct_chg = today.get("pct_chg", None)
     if pct_chg is None or pd.isna(pct_chg):
-        prev = df[df["date"] < td].tail(1)
+        prev = known[known["date"] < td].tail(1)
         pct_chg = (close_today / prev.iloc[0]["close"] - 1) * 100 if not prev.empty else 0.0
 
     # 60日动量
-    past_60 = df[df["date"] <= td].tail(61)
+    past_60 = known.tail(61)
     ret_60d = (close_today / past_60.iloc[0]["close"] - 1) * 100 if len(past_60) >= 2 else None
 
+    close_series = pd.to_numeric(known["close"], errors="coerce").dropna()
+    daily_returns = close_series.pct_change().dropna()
+    ma20 = float(close_series.tail(20).mean()) if len(close_series) >= 5 else float(close_today)
+    ma60 = float(close_series.tail(60).mean()) if len(close_series) >= 10 else ma20
+    previous_ma20 = (
+        float(close_series.iloc[:-5].tail(20).mean())
+        if len(close_series) >= 25
+        else ma20
+    )
+    ma20_slope_5d = (ma20 / previous_ma20 - 1) * 100 if previous_ma20 > 0 else 0.0
+    distance_ma20 = (float(close_today) / ma20 - 1) * 100 if ma20 > 0 else 0.0
+    distance_ma60 = (float(close_today) / ma60 - 1) * 100 if ma60 > 0 else 0.0
+
+    recent_20_returns = daily_returns.tail(20)
+    net_20 = abs(float(close_today) / float(past_20.iloc[0]["close"]) - 1) if len(past_20) >= 2 else 0.0
+    path_20 = float(recent_20_returns.abs().sum())
+    trend_efficiency_20 = net_20 / path_20 if path_20 > 0 else 0.0
+    volatility_20 = (
+        float(recent_20_returns.std(ddof=0) * (252 ** 0.5) * 100)
+        if len(recent_20_returns) >= 10
+        else 0.0
+    )
+
+    recent_5_returns = daily_returns.tail(5)
+    positive_5_returns = recent_5_returns.clip(lower=0)
+    one_day_dominance_5 = (
+        float(positive_5_returns.max() / positive_5_returns.sum())
+        if not positive_5_returns.empty and positive_5_returns.sum() > 0
+        else 0.0
+    )
+    positive_days_5 = int((recent_5_returns > 0).sum())
+
+    amount_series = (
+        pd.to_numeric(known["amount"], errors="coerce")
+        if "amount" in known
+        else pd.Series(dtype=float)
+    )
+    if len(amount_series.dropna()) >= 5:
+        recent_amount = float(amount_series.tail(3).mean())
+        base_amount = float(amount_series.tail(20).mean())
+        amount_persistence_3d = recent_amount / base_amount if base_amount > 0 else 1.0
+    else:
+        amount_persistence_3d = 1.0
+
     # 创 N 日新高检测
-    lookback_20 = df[df["date"] <= td].tail(21)
+    lookback_20 = known.tail(21)
     is_20d_high = close_today >= lookback_20["close"].max() if len(lookback_20) >= 5 else False
-    lookback_60 = df[df["date"] <= td].tail(61)
+    lookback_60 = known.tail(61)
     is_60d_high = close_today >= lookback_60["close"].max() if len(lookback_60) >= 10 else False
 
     # 连涨天数
     consecutive_up = 0
-    for i in range(len(df) - 1, -1, -1):
-        if df.iloc[i]["close"] > df.iloc[i - 1]["close"] if i > 0 else False:
+    for i in range(len(known) - 1, -1, -1):
+        if known.iloc[i]["close"] > known.iloc[i - 1]["close"] if i > 0 else False:
             consecutive_up += 1
         else:
             break
@@ -617,6 +671,16 @@ def calc_etf_metrics(df: pd.DataFrame, target_date: str) -> dict:
         "ret_5d": round(ret_5d, 2) if ret_5d is not None else None,
         "ret_20d": round(ret_20d, 2) if ret_20d is not None else None,
         "ret_60d": round(ret_60d, 2) if ret_60d is not None else None,
+        "ma20": round(ma20, 6),
+        "ma60": round(ma60, 6),
+        "ma20_slope_5d": round(ma20_slope_5d, 2),
+        "distance_ma20": round(distance_ma20, 2),
+        "distance_ma60": round(distance_ma60, 2),
+        "trend_efficiency_20": round(trend_efficiency_20, 3),
+        "volatility_20": round(volatility_20, 2),
+        "one_day_dominance_5": round(one_day_dominance_5, 3),
+        "positive_days_5": positive_days_5,
+        "amount_persistence_3d": round(amount_persistence_3d, 2),
         "accel_5d": accel_5d,
         "vol_ratio": round(vol_ratio, 2),
         "amount_ratio": round(amount_ratio, 2),
@@ -633,6 +697,118 @@ def calc_etf_metrics(df: pd.DataFrame, target_date: str) -> dict:
         "is_60d_high": is_60d_high,
         "consecutive_up": consecutive_up,
     }
+
+
+def calc_relative_profile(
+    df: pd.DataFrame,
+    bench_df: pd.DataFrame,
+    target_date: str,
+) -> dict:
+    """计算与基准同交易日对齐的相对强度和持续跑赢天数。"""
+    empty_profile = {
+        "excess_5d": 0.0,
+        "excess_20d": 0.0,
+        "excess_60d": 0.0,
+        "beat_days_10": 0,
+    }
+    if df.empty or bench_df.empty:
+        return empty_profile
+
+    cutoff = pd.to_datetime(target_date).normalize()
+    left = df.loc[df["date"] <= cutoff, ["date", "close"]].copy()
+    right = bench_df.loc[bench_df["date"] <= cutoff, ["date", "close"]].copy()
+    left["date"] = pd.to_datetime(left["date"]).dt.normalize()
+    right["date"] = pd.to_datetime(right["date"]).dt.normalize()
+    aligned = left.merge(right, on="date", how="inner", suffixes=("_etf", "_bench"))
+    aligned = aligned.sort_values("date").dropna().drop_duplicates("date", keep="last")
+    if len(aligned) < 2:
+        return empty_profile
+
+    def excess_return(days: int) -> float:
+        sample = aligned.tail(days + 1)
+        if len(sample) < 2:
+            return 0.0
+        etf_return = float(sample.iloc[-1]["close_etf"]) / float(sample.iloc[0]["close_etf"]) - 1
+        bench_return = float(sample.iloc[-1]["close_bench"]) / float(sample.iloc[0]["close_bench"]) - 1
+        return ((1 + etf_return) / (1 + bench_return) - 1) * 100
+
+    daily = aligned[["close_etf", "close_bench"]].pct_change().dropna()
+    return {
+        "excess_5d": round(excess_return(5), 2),
+        "excess_20d": round(excess_return(20), 2),
+        "excess_60d": round(excess_return(60), 2),
+        "beat_days_10": int(
+            (daily["close_etf"].tail(10) > daily["close_bench"].tail(10)).sum()
+        ),
+    }
+
+
+def apply_scoring_context(results: list[dict], bench_pct: float) -> list[dict]:
+    """加入去重后的方向宽度，再统一计算三层评分。"""
+    valid = [r for r in results if "error" not in r.get("metrics", {})]
+    theme_rows = []
+    for r in valid:
+        metrics = r["metrics"]
+        theme_rows.append({
+            "major": str(r.get("category") or "其他").split("/")[0],
+            "theme": str(r.get("category") or r.get("direction") or "其他"),
+            "ret_20d": float(metrics.get("ret_20d") or 0),
+            "excess_5d": float(metrics.get("excess_5d") or 0),
+            "excess_20d": float(metrics.get("excess_20d") or 0),
+        })
+
+    theme_stats: dict[str, tuple[float, int]] = {}
+    theme_confirmation: dict[tuple[str, str], tuple[float, float, bool]] = {}
+    if theme_rows:
+        theme_df = pd.DataFrame(theme_rows)
+        deduped = (
+            theme_df.groupby(["major", "theme"], as_index=False)
+            [["ret_20d", "excess_5d", "excess_20d"]]
+            .median()
+        )
+        for major, group in deduped.groupby("major"):
+            positive = (group["ret_20d"] > 0) & (group["excess_20d"] > 0)
+            breadth = float(positive.mean()) if len(group) >= 2 else 0.5
+            confirmations = int(
+                (positive & (group["excess_5d"] >= -1)).sum()
+            )
+            theme_stats[str(major)] = (breadth, confirmations)
+        for row in deduped.itertuples(index=False):
+            confirmed = (
+                float(row.ret_20d) > 0
+                and float(row.excess_20d) > 0
+            )
+            theme_confirmation[(str(row.major), str(row.theme))] = (
+                float(row.ret_20d),
+                float(row.excess_20d),
+                confirmed,
+            )
+
+    for r in results:
+        metrics = r.get("metrics", {})
+        if "error" in metrics:
+            continue
+        major = str(r.get("category") or "其他").split("/")[0]
+        theme = str(r.get("category") or r.get("direction") or "其他")
+        breadth, confirmations = theme_stats.get(major, (0.5, 0))
+        theme_ret20, theme_excess20, theme_confirmed = theme_confirmation.get(
+            (major, theme),
+            (0.0, 0.0, False),
+        )
+        metrics["theme_breadth"] = round(breadth, 3)
+        metrics["theme_confirmations"] = confirmations
+        metrics["theme_ret_20d"] = round(theme_ret20, 2)
+        metrics["theme_excess_20d"] = round(theme_excess20, 2)
+        metrics["theme_confirmed"] = theme_confirmed
+        r["score"] = calc_auto_score(
+            metrics,
+            r.get("stage", ("未知", "", ""))[0],
+            bench_pct,
+            is_qdii=bool(r.get("is_qdii", False)),
+            premium_pct=r.get("premium_pct"),
+            consecutive_strong=int(r.get("strong_days") or 0),
+        )
+    return results
 
 
 def _amount_to_yi(value: float | None) -> float | None:
@@ -670,16 +846,27 @@ def patch_metrics_with_hithink(metrics: dict, hithink_item: dict, target_date: s
     return True
 
 
-def mark_unpatched_stale_results(results: list[dict], target_date: str) -> int:
-    """目标日扫描禁止旧行情混入主排名；未实时补全的旧行情直接熔断。"""
+def mark_unpatched_stale_results(results: list[dict], expected_data_date: str) -> int:
+    """禁止落后于本次A股数据截止日的旧行情混入主排名。"""
     count = 0
+    expected = pd.to_datetime(expected_data_date).normalize()
     for r in results:
         m = r.get("metrics", {})
         if "error" in m:
             continue
-        if m.get("is_stale") and not m.get("realtime_patched"):
+        actual_value = m.get("actual_date")
+        actual = (
+            pd.to_datetime(actual_value).normalize()
+            if actual_value
+            else pd.Timestamp.min
+        )
+        m["is_stale"] = bool(actual < expected)
+        m["stale_days"] = max(0, (expected - actual).days)
+        if actual < expected and not m.get("realtime_patched"):
             actual = m.get("actual_date", "未知")
-            m["error"] = f"旧行情未补全: 行情日期 {actual} < 目标日期 {target_date}"
+            m["error"] = (
+                f"旧行情未补全: 行情日期 {actual} < 数据截止日 {expected_data_date}"
+            )
             r["stage"] = ("数据滞后", "禁止使用", "0%")
             r["score"] = {
                 "total": 0.0,
@@ -712,76 +899,137 @@ def calc_auto_score(
     premium_pct: float | None = None,
     consecutive_strong: int = 0,
 ) -> dict:
-    """
-    自动评分总分 100。
+    """分层评分：主线强度、买点质量和风险惩罚分别计算。
 
-    权重设计原则：短线动量权重 > 长线（捕捉主线切换），
-    连续强于指数是核心主线确认信号。
+    总分只用于排序，不能替代三层门禁。主线分主要由20/60日相对强度、
+    持续跑赢次数、趋势效率和去重后的方向宽度组成；单日涨幅不会再通过
+    多个同源指标重复放大。
     """
     if "error" in m:
         return {
             "total": 0.0, "raw_total": 0.0, "relative": 0.0, "volume": 0.0,
             "momentum": 0.0, "liquidity": 0.0, "trend": 0.0,
             "catalyst": 0.0, "risk_factor": 1.0, "risk_note": "",
+            "mainline": 0.0, "timing": 0.0, "risk_penalty": 100.0,
+            "mainline_pass": False, "timing_pass": False,
+            "gate_reason": str(m.get("error") or "数据无效"),
         }
 
     pct = float(m.get("pct_chg") or 0)
     r5 = float(m.get("ret_5d") or 0)
     r20 = float(m.get("ret_20d") or 0)
-    amount_ratio = float(m.get("amount_ratio") or m.get("vol_ratio") or 1)
+    r60 = float(m.get("ret_60d") or 0)
+    excess5 = float(m.get("excess_5d") or 0)
+    excess20 = float(m.get("excess_20d") or 0)
+    excess60 = float(m.get("excess_60d") or 0)
+    beat_days_10 = float(m.get("beat_days_10") or consecutive_strong)
+    efficiency = float(m.get("trend_efficiency_20") or 0)
+    ma20_slope = float(m.get("ma20_slope_5d") or 0)
+    distance_ma20 = float(m.get("distance_ma20") or 0)
+    distance_ma60 = float(m.get("distance_ma60") or 0)
+    one_day_dominance = float(m.get("one_day_dominance_5") or 0)
+    positive_days_5 = float(m.get("positive_days_5") or 0)
+    amount_persistence = float(
+        m.get("amount_persistence_3d")
+        or m.get("amount_ratio")
+        or m.get("vol_ratio")
+        or 1
+    )
+    volatility_20 = float(m.get("volatility_20") or 0)
+    theme_breadth = float(m.get("theme_breadth") or 0.5)
+    theme_confirmations = float(m.get("theme_confirmations") or 1)
+    theme_confirmed = bool(m.get("theme_confirmed", True))
     amount_yi = float(m.get("amount_yi") or 0)
-    relative = pct - bench_pct
 
-    # 相对强度 15 分。避免单日涨幅、5日动量、阶段分重复占据大部分权重。
-    relative_score = _clip((relative + 2) / 8 * 15, 0, 15)
+    # 主线强度 100 分：慢变量优先，避免单日脉冲重复计分。
+    relative_5_score = _clip((excess5 + 2) / 10 * 15, 0, 15)
+    relative_20_score = _clip((excess20 + 5) / 20 * 20, 0, 20)
+    relative_60_score = _clip((excess60 + 8) / 33 * 15, 0, 15)
+    persistence_score = _clip(beat_days_10 / 8 * 15, 0, 15)
+    efficiency_score = _clip((efficiency - 0.12) / 0.43 * 15, 0, 15)
+    structure_score = 0.0
+    if distance_ma20 >= 0:
+        structure_score += 4.0
+    if distance_ma60 >= 0:
+        structure_score += 3.0
+    if ma20_slope > 0:
+        structure_score += 3.0
+    breadth_score = _clip((theme_breadth - 0.25) / 0.60 * 10, 0, 10)
+    breadth_score += _clip(theme_confirmations / 3 * 5, 0, 5)
+    mainline_score = _clip(
+        relative_5_score
+        + relative_20_score
+        + relative_60_score
+        + persistence_score
+        + efficiency_score
+        + structure_score
+        + breadth_score,
+        0,
+        100,
+    )
 
-    # 成交质量 10 分。温和放量最好，极端天量不再继续加分，避免高潮日追涨。
-    if amount_ratio <= 0.7:
-        volume_score = 0.0
-    elif amount_ratio <= 1.8:
-        volume_score = _clip((amount_ratio - 0.7) / 1.1 * 10, 0, 10)
-    elif amount_ratio <= 3.0:
-        volume_score = 10.0
+    # 买点质量 100 分：强趋势可买，但过度延伸或单日贡献过高会降分。
+    if r5 <= 10:
+        r5_timing = _clip((r5 + 2) / 12 * 25, 0, 25)
     else:
-        volume_score = _clip(10 - (amount_ratio - 3.0) * 2, 3, 10)
+        r5_timing = _clip(25 - (r5 - 10) * 1.2, 4, 25)
 
-    # 动量 25 分：5日负责切换速度，20日负责趋势持续性；极端动量递减。
-    r5_score = _clip((r5 + 3) / 13 * 15, 0, 15)
-    if r5 > 12:
-        r5_score = _clip(15 - (r5 - 12) * 0.5, 4, 15)
-    if r20 > 30:
-        r20_score = _clip(10 - (r20 - 30) * 0.25, 2, 10)
+    if -3 <= distance_ma20 <= 8:
+        distance_score = _clip(25 - abs(distance_ma20 - 2.5) * 2.3, 10, 25)
+    elif distance_ma20 < -3:
+        distance_score = _clip(10 + distance_ma20, 0, 10)
     else:
-        r20_score = _clip((r20 + 5) / 30 * 10, 0, 10)
-    momentum_score = r5_score + r20_score
+        distance_score = _clip(18 - (distance_ma20 - 8) * 2, 0, 18)
 
-    # 反弹识别：5日强但20日弱 → 大概率只是脉冲，不是主线
-    bounce_penalty = 1.0
-    if r5 > 3 and r20 < 2:
-        bounce_penalty = 0.7
-    if r5 > 3 and r20 < 0:
-        bounce_penalty = 0.5
-    if r5 > 5 and r20 < -2:
-        bounce_penalty = 0.3
+    dominance_score = _clip((0.80 - one_day_dominance) / 0.60 * 20, 0, 20)
+    positive_days_score = _clip(positive_days_5 / 4 * 15, 0, 15)
+    if 0.85 <= amount_persistence <= 2.2:
+        volume_score = _clip(15 - abs(amount_persistence - 1.35) * 7, 7, 15)
+    elif amount_persistence < 0.85:
+        volume_score = _clip(amount_persistence / 0.85 * 7, 0, 7)
+    else:
+        volume_score = _clip(10 - (amount_persistence - 2.2) * 2, 3, 10)
+    timing_score = (
+        r5_timing
+        + distance_score
+        + dominance_score
+        + positive_days_score
+        + volume_score
+    )
 
-    # 高位透支识别：已创新高 + 加速拉升 → 追买即接盘（机器人0703/科创材料0630教训）
-    # 评分不能把"刚冲到顶"的板块奖成第一，越透支越降权
-    accel_5d = float(m.get("accel_5d") or 0)
-    extension_penalty = 1.0
-    if m.get("is_20d_high") and accel_5d > 6:
-        extension_penalty = 0.8
-    if m.get("is_20d_high") and (pct > 6 or r5 > 12):
-        extension_penalty = 0.65
+    # 风险惩罚单列，不能由其他高分抵消。
+    risk_penalty = 0.0
+    risk_reasons = []
+    if one_day_dominance > 0.65 and r20 < 8:
+        risk_penalty += 12
+        risk_reasons.append("5日涨幅过度依赖单日")
+    if one_day_dominance > 0.80:
+        risk_penalty += 8
+        risk_reasons.append("单日脉冲占比极高")
+    if r20 < 0:
+        risk_penalty += 10
+        risk_reasons.append("20日趋势为负")
+    if r60 < 0:
+        risk_penalty += 6
+        risk_reasons.append("60日趋势为负")
+    if distance_ma20 > 12:
+        risk_penalty += min(12, (distance_ma20 - 12) * 1.2)
+        risk_reasons.append("偏离MA20过远")
+    if r5 > 15:
+        risk_penalty += 8
+        risk_reasons.append("5日涨幅过热")
+    if r20 > 35:
+        risk_penalty += 5
+        risk_reasons.append("20日涨幅过热")
+    if r60 > 50:
+        risk_penalty += min(12, (r60 - 50) * 0.3)
+        risk_reasons.append("60日趋势拥挤")
+    if volatility_20 > 45:
+        risk_penalty += min(10, (volatility_20 - 45) * 0.3)
+        risk_reasons.append("波动率过高")
     if "加速见顶" in stage or "加速期⚠" in stage:
-        extension_penalty = min(extension_penalty, 0.6)
-
-    # 趋势质量 15 分：连续相对强势 + 5/20日同向，区分持续主线和单日脉冲。
-    trend_score = min(10.0, consecutive_strong * 1.5)
-    if r5 > 0 and r20 > 0:
-        trend_score += 3.0
-    if r5 > 3 and r20 > 5 and accel_5d >= -2:
-        trend_score += 2.0
-    trend_score = min(15.0, trend_score)
+        risk_penalty += 8
+        risk_reasons.append(stage)
 
     # 流动性: 5 分
     if amount_yi >= 5:
@@ -793,54 +1041,74 @@ def calc_auto_score(
     else:
         liquidity_score = 0
 
-    # 主力资金流 15 分（独立于价格动量，是短线执行的重要确认）。
+    # 实时资金流只展示，不混入历史可复算的核心技术总分。
     extra = m.get("_hithink_extra") or {}
     main_flow_yi = extra.get("main_flow_yi")
     flow_score_raw, flow_note = calc_money_flow_score(main_flow_yi)
-    flow_score = flow_score_raw * 1.5
+    flow_score = flow_score_raw
 
-    catalyst_hints = {
-        "扩散期": 5,
-        "加速期": 3,
-        "确认期": 3,
-        "萌芽期": 2,
-        "观察期": 1,
-        "加速期⚠": 0,
-        "加速见顶⚠": 0,
-    }
-    catalyst_score = catalyst_hints.get(stage, 0)
-
-    # 市场热度加分（来自同花顺热搜/热门板块）
-    hot_keywords = m.get("_hot_keywords", set())
-    hot_name = m.get("_etf_name", "")
-    hot_cat = m.get("_etf_category", "")
-    sentiment_bonus = calc_sentiment_bonus(hot_name, hot_cat, hot_keywords)
-
-    raw_total = (
-        relative_score
-        + volume_score
-        + momentum_score
-        + trend_score
-        + liquidity_score
-        + flow_score
-        + catalyst_score
-        + sentiment_bonus
-    )
+    raw_total = 0.65 * mainline_score + 0.35 * timing_score - risk_penalty
     risk_factor, risk_note = premium_discount_factor(is_qdii=is_qdii, premium_pct=premium_pct)
-    total = raw_total * risk_factor * bounce_penalty * extension_penalty
+    total = _clip(raw_total * risk_factor, 0, 100)
+
+    established_trend = (
+        r20 > 0
+        and excess20 > 0
+        and distance_ma20 >= -2
+        and ma20_slope >= 0
+    )
+    strong_reversal = r20 >= 15 and beat_days_10 >= 6 and theme_breadth >= 0.55
+    one_day_trap = one_day_dominance > MAX_NEW_POSITION_ONE_DAY_DOMINANCE
+    mainline_pass = (
+        (established_trend or strong_reversal)
+        and (beat_days_10 >= 5 or theme_breadth >= 0.60)
+        and theme_confirmed
+        and not one_day_trap
+    )
+    late_extension = r60 > 60 and r20 > 20 and distance_ma20 > 6
+    timing_pass = (
+        timing_score >= 50
+        and distance_ma20 <= 15
+        and r5 <= 25
+        and not late_extension
+    )
+    gate_reason = ""
+    if one_day_trap:
+        gate_reason = (
+            "5日上涨过度依赖单日脉冲"
+            f"（>{MAX_NEW_POSITION_ONE_DAY_DOMINANCE:.0%}）"
+        )
+    elif not (established_trend or strong_reversal):
+        gate_reason = "20日相对趋势或MA20结构未确认"
+    elif not (beat_days_10 >= 5 or theme_breadth >= 0.60):
+        gate_reason = "持续跑赢次数和方向宽度均不足"
+    elif not theme_confirmed:
+        gate_reason = "所属子主题20日收益或相对收益未确认"
+    elif late_extension:
+        gate_reason = "60日趋势拥挤且价格偏离MA20"
+    elif not timing_pass:
+        gate_reason = "买点过热、偏离趋势或质量不足"
 
     return {
         "total": round(total, 1),
         "raw_total": round(raw_total, 1),
-        "relative": round(relative_score, 1),
+        "mainline": round(mainline_score, 1),
+        "timing": round(timing_score, 1),
+        "risk_penalty": round(risk_penalty, 1),
+        "one_day_dominance": round(one_day_dominance, 3),
+        "mainline_pass": mainline_pass,
+        "timing_pass": timing_pass,
+        "gate_reason": gate_reason,
+        "relative": round(relative_5_score + relative_20_score + relative_60_score, 1),
         "volume": round(volume_score, 1),
-        "momentum": round(momentum_score, 1),
-        "trend": round(trend_score, 1),
+        "momentum": round(relative_20_score + relative_60_score, 1),
+        "trend": round(persistence_score + efficiency_score + structure_score, 1),
+        "breadth": round(breadth_score, 1),
         "liquidity": round(liquidity_score, 1),
         "money_flow": round(flow_score, 1),
-        "catalyst": round(catalyst_score, 1),
+        "catalyst": 0.0,
         "risk_factor": round(risk_factor, 2),
-        "risk_note": risk_note,
+        "risk_note": "；".join(filter(None, [risk_note, *risk_reasons])),
         "flow_note": flow_note,
     }
 
@@ -872,13 +1140,13 @@ def classify_stage(m: dict, consecutive_strong: int = 0) -> tuple:
     # 大趋势未破的剧烈洗盘：商品、资源、强趋势主题经常出现。
     # 先判为趋势回撤期，交给持仓规则用移动止损决定是否离场。
     if r20 > 25 and r60 > 40 and r5 < -8 and amount_yi >= 1:
-        return ("趋势回撤期", "持有观察，跌破趋势止损再清仓", "10-20%")
+        return ("趋势回撤期", "持有观察，跌破趋势止损再清仓", "仅诊断")
 
     # 衰竭：连续走弱
     if r5 < -3 and vol < 0.8:
-        return ("衰竭期", "清仓或大幅减仓", "0-10%")
+        return ("衰竭期", "清仓或大幅减仓", "仅诊断")
     if r5 < -2 and pct < -1:
-        return ("衰弱期", "减仓观望", "5-15%")
+        return ("衰弱期", "减仓观望", "仅诊断")
 
     # 过热判断（加入量价结构）：
     # - 缩量+减速 → 加速见顶⚠
@@ -886,28 +1154,28 @@ def classify_stage(m: dict, consecutive_strong: int = 0) -> tuple:
     # - 放量+减速 → 加速期⚠（持有但不加仓）
     if r20 > 30:
         if vol < 1.0 and accel < 0:
-            return ("加速见顶⚠", "逐步减仓，不追", "10-20%")
+            return ("加速见顶⚠", "逐步减仓，不追", "仅诊断")
         if vol >= 1.2 and accel >= 0:
-            return ("加速期", "趋势延续，持有", "20-30%")
-        return ("加速期⚠", "持有但不加仓，设紧止损", "15-25%")
+            return ("加速期", "趋势延续，持有", "组合层计算")
+        return ("加速期⚠", "持有但不加仓，设紧止损", "组合层计算")
 
     # 加速：5日动量>8%且加速中
     if r5 > 8 and accel > 0:
-        return ("加速期", "持有，逐步提止损", "20-30%")
+        return ("加速期", "持有，逐步提止损", "组合层计算")
 
     # 扩散：5日>3%且放量
     if r5 > 3 and vol > 1.2:
-        return ("扩散期", "核心仓位，可加仓", "30-40%")
+        return ("扩散期", "核心仓位，可加仓", "组合层计算")
 
     # 确认：连续强势或放量上涨
     if (r5 > 2 and vol > 1.0) or consecutive_strong >= 2:
-        return ("确认期", "试探建仓/加仓", "15-25%")
+        return ("确认期", "试探建仓/加仓", "组合层计算")
     if pct > 2 and vol > 1.2:
-        return ("确认期", "试探建仓", "10-20%")
+        return ("确认期", "试探建仓", "组合层计算")
 
     # 萌芽：首次放量
     if pct > 1.5 and vol > 1.5:
-        return ("萌芽期", "加入观察，等待回踩", "0-10%")
+        return ("萌芽期", "加入观察，等待回踩", "仅诊断")
 
     # 震荡/休眠
     if abs(pct) < 1:
@@ -953,12 +1221,15 @@ def _rank_key(r: dict) -> tuple:
     m = r.get("metrics", {})
     score = r.get("score", {}).get("total", 0)
     stage = r.get("stage", ("", "", ""))[0]
+    code = str(r.get("etf_code") or "")
+    code_tiebreaker = -int(code) if code.isdigit() else -999999
     return (
         score,
         STAGE_PRIORITY.get(stage, -99),
         m.get("pct_chg", 0) or 0,
         m.get("ret_5d", 0) or 0,
         m.get("amount_yi", 0) or 0,
+        code_tiebreaker,
     )
 
 
@@ -1048,11 +1319,14 @@ def _portfolio_rank_key(r: dict) -> tuple:
     m = r.get("metrics", {})
     score = float(r.get("score", {}).get("total") or 0)
     adjusted = score + _specificity_score(r)
+    code = str(r.get("etf_code") or "")
+    code_tiebreaker = -int(code) if code.isdigit() else -999999
     return (
         adjusted,
         STAGE_PRIORITY.get(r.get("stage", ("", "", ""))[0], -99),
         float(m.get("ret_5d") or 0),
         float(m.get("amount_yi") or 0),
+        code_tiebreaker,
     )
 
 
@@ -1064,12 +1338,11 @@ def _portfolio_exclusion_reason(r: dict, market_state: str = "未知") -> str | 
         return str(m.get("error"))
     if stage not in NEW_MONEY_STAGES:
         return f"{stage}不适合作为新组合主仓"
-    if score < CORE_ENTRY_SCORE:
-        return f"评分{score:.1f}<{CORE_ENTRY_SCORE:.0f}分核心门槛"
-    if r.get("category") in {"货币", "债券"}:
+    layers_ok, layer_reason = score_layers_pass(r.get("score", {}), market_state)
+    if not layers_ok:
+        return layer_reason
+    if category_root(r.get("category", "")) in {"货币", "债券"}:
         return "现金/债券工具不进入进攻组合"
-    if r.get("is_qdii"):
-        return "QDII/跨境ETF折溢价未知，不作为默认主仓"
     if float(m.get("amount_yi") or 0) < PORTFOLIO_MIN_AMOUNT_YI:
         return f"成交额<{PORTFOLIO_MIN_AMOUNT_YI:.0f}亿，不作为主仓"
     if m.get("overheat") and float(m.get("pct_chg") or 0) >= 7:
@@ -1120,11 +1393,8 @@ def pick_formal_portfolio(
     industry_count: dict[str, int] = {}
     cluster_count: dict[str, int] = {}
     broad_count = 0
-    cluster_limit = (
-        target_count
-        if market_state == "主升"
-        else MAX_SAME_RISK_CLUSTER
-    )
+    target_count = min(target_count, max_selection_count(market_state))
+    cluster_limit = max_same_risk_cluster(market_state)
 
     for r in ordered:
         ind = r.get("industry", "其他")
@@ -1179,44 +1449,6 @@ def pick_formal_portfolio(
         industry_count[ind] = industry_count.get(ind, 0) + 1
         cluster_count[cluster] = cluster_count.get(cluster, 0) + 1
 
-    # 强信号不足三只时仍只从固定池补位。补位拒绝低流动性、衰竭、
-    # 过热和默认无法核验折溢价的跨境品种。
-    if len(selected) < target_count:
-        blocked_stages = {"衰竭期", "衰弱期", "弱势期", "加速见顶⚠"}
-        selected_codes = {r.get("etf_code") for r in selected}
-        fallback = sorted(candidates, key=_portfolio_rank_key, reverse=True)
-        for r in fallback:
-            if len(selected) >= target_count:
-                break
-            if r.get("etf_code") in selected_codes:
-                continue
-            m = r.get("metrics", {})
-            ind = r.get("industry", "其他")
-            if "error" in m or r.get("category") == "货币":
-                continue
-            if float(r.get("score", {}).get("total") or 0) < FALLBACK_ENTRY_SCORE:
-                continue
-            if r.get("stage", ("", "", ""))[0] in blocked_stages:
-                continue
-            if r.get("is_qdii") or float(m.get("amount_yi") or 0) < PORTFOLIO_MIN_AMOUNT_YI:
-                continue
-            if m.get("overheat") and float(m.get("pct_chg") or 0) >= 7:
-                continue
-            if ind == "宽基" and broad_count >= PORTFOLIO_MAX_BROAD:
-                continue
-            if ind != "宽基" and industry_count.get(ind, 0) >= PORTFOLIO_MAX_SAME_INDUSTRY:
-                continue
-            cluster = risk_cluster(r.get("category", "其他"), ind, r.get("etf_name", ""))
-            if cluster_count.get(cluster, 0) >= cluster_limit:
-                continue
-            r = {**r, "portfolio_tier": "补位"}
-            selected.append(r)
-            selected_codes.add(r.get("etf_code"))
-            if ind == "宽基":
-                broad_count += 1
-            industry_count[ind] = industry_count.get(ind, 0) + 1
-            cluster_count[cluster] = cluster_count.get(cluster, 0) + 1
-
     selected_codes = {r.get("etf_code") for r in selected}
     excluded = [
         (r, reason)
@@ -1226,13 +1458,86 @@ def pick_formal_portfolio(
     return selected, excluded
 
 
-def generate_report(results: list, market_env: dict, bench_pct: float, target_date: str, hithink_used: bool = False) -> str:
+def build_formal_snapshot(results: list[dict], market_state: str) -> dict:
+    """Build the machine-authoritative portfolio shortlist from scanner results."""
+    valid = [r for r in results if "error" not in r.get("metrics", {})]
+    actionable = [
+        r
+        for r in valid
+        if (
+            r.get("stage", ("", "", ""))[0] not in EXCLUDED_STAGES
+            and r.get("stage", ("", "", ""))[0] != "观察期"
+        )
+        or (
+            r.get("stage", ("", "", ""))[0] == "观察期"
+            and float(r.get("metrics", {}).get("pct_chg") or 0) > 1
+        )
+    ]
+    pool_candidates = sorted(
+        [r for r in actionable if r.get("category") != "货币"],
+        key=_rank_key,
+        reverse=True,
+    )
+    picks, _ = pick_formal_portfolio(
+        pool_candidates,
+        target_count=3,
+        market_state=market_state,
+    )
+    picks = picks[:3]
+    weights = allocate_instrument_weights(market_state, picks)
+    candidates = []
+    for rank, (row, weight) in enumerate(zip(picks, weights), 1):
+        score = row.get("score") or {}
+        candidates.append(
+            {
+                "rank": rank,
+                "code": str(row.get("etf_code") or ""),
+                "name": str(row.get("etf_name") or ""),
+                "direction": str(row.get("direction") or ""),
+                "product_type": str(row.get("product_type") or "ETF"),
+                "is_qdii": bool(row.get("is_qdii", False)),
+                "premium_pct": row.get("premium_pct"),
+                "industry": str(row.get("industry") or "其他"),
+                "stage": str(row.get("stage", ("未知", "", ""))[0]),
+                "score": float(score.get("total") or 0),
+                "mainline_score": float(score.get("mainline") or 0),
+                "timing_score": float(score.get("timing") or 0),
+                "risk_penalty": float(score.get("risk_penalty") or 0),
+                "scanner_weight_pct": float(weight),
+            }
+        )
+    exposure = round(sum(weights), 2)
+    exposure_floor = float(get_position_cap(market_state).low)
+    return {
+        "market_state": market_state,
+        "candidates": candidates,
+        "cash_pct": round(100.0 - exposure, 2),
+        "exposure_floor_pct": exposure_floor,
+        "deployment_status": (
+            "ready"
+            if exposure + 0.05 >= exposure_floor
+            else "blocked_below_exposure_floor"
+        ),
+    }
+
+
+def generate_report(
+    results: list,
+    market_env: dict,
+    bench_pct: float,
+    target_date: str,
+    hithink_used: bool = False,
+    data_cutoff: str | None = None,
+) -> str:
     """三层分析报告"""
     source_tag = " | 同花顺资金增强已启用" if hithink_used else ""
 
     lines = []
     lines.append(f"# ETF 三层分析报告 — {target_date}{source_tag}")
     lines.append("")
+    if data_cutoff:
+        lines.append(f"- 数据截止时间：{data_cutoff}")
+        lines.append("")
 
     # ---- 第一层：市场环境 ----
     lines.append("## 第一层：市场环境")
@@ -1244,7 +1549,7 @@ def generate_report(results: list, market_env: dict, bench_pct: float, target_da
     lines.append(f"| 上涨家数 | {me['up_count']} |")
     lines.append(f"| 下跌家数 | {me['down_count']} |")
     lines.append(f"| 涨跌比 | {me['up_ratio']} |")
-    lines.append(f"| 建议仓位上限 | **{me['position_cap']}** |")
+    lines.append(f"| 风险预算范围 | **{me['position_cap']}** |")
     lines.append("")
     lines.append(f"> {me['note']}")
     lines.append("")
@@ -1278,7 +1583,7 @@ def generate_report(results: list, market_env: dict, bench_pct: float, target_da
     valid_results = [r for r in results if "error" not in r["metrics"]]
     ranked_results = sorted(valid_results, key=_rank_key, reverse=True)
 
-    lines.append("| 排名 | 方向 | 类型 | 分类 | 行情日期 | 涨跌幅 | 5日动量 | 20日动量 | 量比 | 成交额(亿) | 连强 | 阶段 | 评分 | 风控 | 建议动作 | 仓位 |")
+    lines.append("| 排名 | 方向 | 类型 | 分类 | 行情日期 | 涨跌幅 | 5日动量 | 20日动量 | 量比 | 成交额(亿) | 连强 | 阶段 | 评分 | 风控 | 建议动作 | 阶段仓位提示 |")
     lines.append("|---:|---|---|---|---|---:|---:|---:|---:|---:|---:|---|---:|---|---|---:|")
 
     actionable = []  # 可操作的方向
@@ -1394,23 +1699,33 @@ def generate_report(results: list, market_env: dict, bench_pct: float, target_da
             lines.append("")
         lines.append("正式池内候选（唯一方向口径，仍需完成催化、买点和盈亏比检查）：")
         lines.append("")
-        lines.append("| 优先级 | 方向 | 类型 | 行业 | 阶段 | 评分 | 层级 | 建议仓位 | 池内标的 |")
-        lines.append("|---:|---|---|---|---|---:|---|---:|---|")
-        formal_weights = allocate_ranked_weights(market_state, len(formal_picks[:3]))
+        lines.append("| 优先级 | 方向 | 类型 | 行业 | 阶段 | 总分 | 主线 | 买点 | 风险罚分 | 建议仓位 | 池内标的 |")
+        lines.append("|---:|---|---|---|---|---:|---:|---:|---:|---:|---|")
+        formal_weights = allocate_instrument_weights(market_state, formal_picks[:3])
         for i, r in enumerate(formal_picks[:3], 1):
             product_note = r.get("product_type", "ETF")
             if r.get("is_qdii"):
                 product_note = f"{product_note}/QDII"
+            score = r.get("score", {})
             lines.append(
                 f"| {i} | {r['direction']} | {product_note} | {r['industry']} | {r['stage'][0]} | {r['score']['total']:.1f} "
-                f"| {r.get('portfolio_tier', '核心')} | {formal_weights[i - 1]:g}% "
+                f"| {float(score.get('mainline') or 0):.1f} | {float(score.get('timing') or 0):.1f} "
+                f"| {float(score.get('risk_penalty') or 0):.1f} | {formal_weights[i - 1]:g}% "
                 f"| {r['etf_name']} `{r['etf_code']}` |"
             )
         cash_weight = round(100 - sum(formal_weights), 1)
-        lines.append(f"| — | 现金 | 现金 | — | — | — | — | {cash_weight:g}% | — |")
-        if len(formal_picks) < 3:
+        lines.append(f"| — | 现金 | 现金 | — | — | — | — | — | — | {cash_weight:g}% | — |")
+        exposure_floor = get_position_cap(market_state).low
+        if sum(formal_weights) + 0.05 < exposure_floor:
             lines.append("")
-            lines.append("> 候选不足3只，本表仅为观察草稿，不得生成正式预测。")
+            lines.append(
+                f"> 部署阻断：正式候选合计仓位 {sum(formal_weights):g}% "
+                f"低于{market_state}最低风险预算 {exposure_floor:g}%；"
+                "不得把该结果标记为可执行组合。"
+            )
+        if len(formal_picks) < max_selection_count(market_state):
+            lines.append("")
+            lines.append("> 正式组合允许 0–3 只；未使用的风险预算保留为现金，不以低质量候选补位。")
         if formal_excluded:
             shown = 0
             lines.append("")
@@ -1425,7 +1740,7 @@ def generate_report(results: list, market_env: dict, bench_pct: float, target_da
         lines.append("")
         lines.append("去相关组合参考（诊断参考，非执行组合）：")
         lines.append("")
-        lines.append("| 优先级 | 方向 | 类型 | 行业 | 阶段 | 评分 | 建议仓位 | 池内标的 |")
+        lines.append("| 优先级 | 方向 | 类型 | 行业 | 阶段 | 评分 | 阶段仓位提示 | 池内标的 |")
         lines.append("|---:|---|---|---|---|---:|---|---|")
         for i, r in enumerate(picks[:3], 1):
             product_note = r.get("product_type", "ETF")
@@ -1438,7 +1753,7 @@ def generate_report(results: list, market_env: dict, bench_pct: float, target_da
         lines.append("")
         lines.append("> 原始强度和去相关组合只用于解释资金主线；周度正式 selection 只能从“正式池内候选”继续做催化、买点、折溢价风险和盈亏比检查。")
     else:
-        lines.append("> 固定池没有可用行情候选，本报告仅为数据异常草稿，不得生成正式预测。")
+        lines.append("> 当前没有同时通过主线、买点和风险门禁的标的；正式动作是空仓等待。")
 
     return "\n".join(lines)
 
@@ -1458,6 +1773,12 @@ def main():
 
     target_date = args.date or datetime.now().strftime("%Y-%m-%d")
     target_ts = pd.to_datetime(target_date).normalize()
+    strategy_manifest = load_current_manifest() or {}
+    manifest_ok, manifest_errors = verify_manifest(strategy_manifest)
+    if not strategy_manifest or not manifest_ok:
+        details = "; ".join(manifest_errors) if manifest_errors else "未找到当前策略清单"
+        print(f"错误: 冻结策略清单无效，禁止生成扫描: {details}", file=sys.stderr)
+        sys.exit(3)
     latest_realtime_ts = get_latest_realtime_trade_ts()
     use_hithink_realtime = bool(args.hithink and target_ts == latest_realtime_ts)
     if args.hithink and target_ts != latest_realtime_ts:
@@ -1482,7 +1803,7 @@ def main():
         sys.exit(1)
     
     print(f"Layer 2: ETF 全量扫描 ({len(etf_pool)} 只，来源=scripts/etf.txt)...", file=sys.stderr)
-    start_date = (pd.to_datetime(target_date) - timedelta(days=45)).strftime("%Y%m%d")
+    start_date = (pd.to_datetime(target_date) - timedelta(days=120)).strftime("%Y%m%d")
     end_date = datetime.now().strftime("%Y%m%d")
 
     # 基准：查找沪深300 ETF (code=510300)
@@ -1501,6 +1822,7 @@ def main():
     ) if bench_cfg else pd.DataFrame()
     bench_m = calc_etf_metrics(bench_df, target_date)
     bench_pct = bench_m.get("pct_chg", 0.0)
+    benchmark_data_date = str(bench_m.get("actual_date") or target_date)
 
     def analyze_one(item: tuple[str, dict]) -> dict:
         direction, cfg = item
@@ -1513,16 +1835,9 @@ def main():
             offline=args.offline,
         )
         metrics = calc_etf_metrics(df, target_date)
+        metrics.update(calc_relative_profile(df, bench_df, target_date))
         strong_days = calc_consecutive_strong(df, bench_df, target_date)
         stage = classify_stage(metrics, strong_days)
-        score = calc_auto_score(
-            metrics,
-            stage[0],
-            bench_pct,
-            is_qdii=cfg.get("is_qdii", False),
-            premium_pct=cfg.get("premium_pct"),
-            consecutive_strong=strong_days,
-        )
         return {
             "direction": direction,
             "etf_code": cfg["code"],
@@ -1531,11 +1846,12 @@ def main():
             "industry": cfg["ind"],
             "product_type": cfg.get("type", "ETF"),
             "is_qdii": cfg.get("is_qdii", False),
+            "premium_pct": cfg.get("premium_pct"),
             "aliases": cfg.get("aliases", []),
             "metrics": metrics,
             "stage": stage,
             "strong_days": strong_days,
-            "score": score,
+            "score": {},
         }
 
     total = len(etf_pool)
@@ -1565,6 +1881,20 @@ def main():
             results.append(result)
             if done_count % 10 == 0 or done_count == total:
                 print(f"  已完成 {done_count}/{total}: {direction}", file=sys.stderr)
+
+    results.sort(key=lambda row: (str(row.get("etf_code") or ""), str(row.get("direction") or "")))
+    if not bench_m.get("actual_date"):
+        available_dates = sorted(
+            {
+                str(row.get("metrics", {}).get("actual_date"))
+                for row in results
+                if row.get("metrics", {}).get("actual_date")
+                and "error" not in row.get("metrics", {})
+            }
+        )
+        if available_dates:
+            benchmark_data_date = available_dates[-1]
+    apply_scoring_context(results, bench_pct)
 
     # Layer 2.5: 同花顺资金增强 + 热度查询
     valid_count = sum(1 for r in results if "error" not in r["metrics"])
@@ -1598,13 +1928,7 @@ def main():
                         "hithink_chg": hf[code].get("hithink_chg"),
                         "hithink_amt": hf[code].get("hithink_amt"),
                     }
-                    # Re-score with money flow
-                    r["score"] = calc_auto_score(
-                        r["metrics"], r["stage"][0], bench_pct,
-                        consecutive_strong=r.get("strong_days", 0),
-                        is_qdii=r.get("is_qdii", False),
-                        premium_pct=r.get("premium_pct"),
-                    )
+            apply_scoring_context(results, bench_pct)
         elif valid_count == 0:
             print(f"错误: {target_date} 没有任何有效行情且同花顺数据也不可用", file=sys.stderr)
             print("提示: 请检查 AKShare 网络连接，或手动运行 hithink CLI 确认 API 配置", file=sys.stderr)
@@ -1613,7 +1937,7 @@ def main():
         print(f"错误: {target_date} 没有任何历史有效行情；历史日期禁止用同花顺实时数据回填", file=sys.stderr)
         sys.exit(2)
 
-    stale_excluded = mark_unpatched_stale_results(results, target_date)
+    stale_excluded = mark_unpatched_stale_results(results, benchmark_data_date)
     if stale_excluded:
         print(f"  数据新鲜度门禁: 剔除 {stale_excluded} 只未实时补全的旧行情 ETF/LOF", file=sys.stderr)
 
@@ -1621,7 +1945,19 @@ def main():
     out_path = PROJECT_ROOT / "codex" / "stock" / target_date / "etf_scan.md"
     os.makedirs(out_path.parent, exist_ok=True)
     mode_note = " + 同花顺资金增强" if hithink_used else ""
-    report = generate_report(results, market_env, bench_pct, target_date, hithink_used=hithink_used)
+    data_cutoff = f"{benchmark_data_date} 15:00"
+    formal_snapshot = build_formal_snapshot(
+        results,
+        str(market_env.get("market_state") or "未知"),
+    )
+    report = generate_report(
+        results,
+        market_env,
+        bench_pct,
+        target_date,
+        hithink_used=hithink_used,
+        data_cutoff=data_cutoff,
+    )
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(report)
     display_path = f"codex/stock/{target_date}/etf_scan.md"
@@ -1651,11 +1987,41 @@ def main():
             "industry": r.get("industry"),
             "direction": r.get("direction"),
             "is_qdii": r.get("is_qdii", False),
+            "actual_date": m.get("actual_date"),
+            "raw_score": (r.get("score") or {}).get("raw_total", 0.0),
+            "mainline_score": (r.get("score") or {}).get("mainline", 0.0),
+            "timing_score": (r.get("score") or {}).get("timing", 0.0),
+            "risk_penalty": (r.get("score") or {}).get("risk_penalty", 0.0),
+            "one_day_dominance": (r.get("score") or {}).get(
+                "one_day_dominance",
+                0.0,
+            ),
         })
-    scan_rows.sort(key=lambda x: -(x["score"] or 0))
+    scan_rows.sort(
+        key=lambda row: (
+            -float(row.get("score") or 0),
+            str(row.get("code") or ""),
+        )
+    )
+    scan_payload = {
+        "schema_version": 2,
+        "date": target_date,
+        "signal_date": target_date,
+        "data_cutoff": data_cutoff,
+        "generated_at": datetime.now().replace(microsecond=0).isoformat(sep=" "),
+        "strategy_version": strategy_manifest.get("strategy_version"),
+        "strategy_sha256": strategy_manifest.get("combined_sha256"),
+        "market_state": formal_snapshot["market_state"],
+        "formal_candidates": formal_snapshot["candidates"],
+        "cash_pct": formal_snapshot["cash_pct"],
+        "exposure_floor_pct": formal_snapshot["exposure_floor_pct"],
+        "deployment_status": formal_snapshot["deployment_status"],
+        "bench_pct": bench_pct,
+        "rows": scan_rows,
+    }
     with open(out_path.parent / "scan.json", "w", encoding="utf-8") as jf:
-        _json.dump({"date": target_date, "bench_pct": bench_pct, "rows": scan_rows},
-                   jf, ensure_ascii=False)
+        _json.dump(scan_payload, jf, ensure_ascii=False, indent=2)
+        jf.write("\n")
 
     # 终端摘要
     valid_count = sum(1 for r in results if "error" not in r["metrics"])

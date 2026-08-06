@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "strategy_version": "2.5.2",
+  "strategy_sha256": "2cd080ff776bcf376eb2459b5c32f87cff81c43a8e85e3260048d190fcefac7a",
+  "strategy_integrity": true,
+  "strategy_integrity_errors": [],
+  "sample_classification": "历史回放（非样本外）",
+  "forward_start": "2026-07-27",
+  "forward_observed_trading_days": 0,
+  "minimum_forward_weeks": 26,
+  "parameters": {
+    "start": "2026-05-01",
+    "end": "2026-07-26",
+    "frequency": "weekly",
+    "top_n": 3,
+    "minimum_amount_yi": 0.2,
+    "offline": true,
+    "one_way_cost_bps": 8.0,
+    "stop_slippage_bps": 10.0,
+    "min_hold_trading_days": 10
+  },
+  "universe_quality": "partial",
+  "universe_file_sha256": "906f5055c619df9edf0d286dc1c77aca01c42d35b1b8b82c28d1f1184689350d",
+  "artifacts": {
+    "backtest_v2.5.2_2026-05-01_to_2026-07-26_weekly_daily_equity.csv": "fd96b8f51043a27e3096a188d49e3e771885f4e44ad16aadff8b47b8f23eb567",
+    "backtest_v2.5.2_2026-05-01_to_2026-07-26_weekly_positions.csv": "a6547b888facdb6dc792c91846c0288bbd9bea24a1357b4f34cb87c3333da9c9",
+    "backtest_v2.5.2_2026-05-01_to_2026-07-26_weekly_trades.csv": "c7c8c23ba753bffd4da424cb6d59ee92d5798712b6d4ce3ce6c1f77ed6463304"
+  }
+}

@@ -113,7 +113,7 @@ def main() -> None:
     parser.add_argument("--test-weeks", type=int, default=13)
     parser.add_argument(
         "--output",
-        default=str(PROJECT_ROOT / "codex" / "stock" / "walkforward_result.md"),
+        default=str(PROJECT_ROOT / "check" / "walkforward_result.md"),
     )
     args = parser.parse_args()
     result = run_backtest(args.start, args.end, freq="weekly")

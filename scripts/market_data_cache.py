@@ -585,8 +585,11 @@ def load_history(
     result = stored[
         (stored["date"] >= requested_start) & (stored["date"] <= effective_end)
     ].copy() if not stored.empty else pd.DataFrame()
+    # Use the canonical store for coverage: when the requested end is a market
+    # holiday, a later cached bar proves there was no missing in-range session.
+    # Checking the sliced result alone incorrectly marks such ranges incomplete.
     final_start_ok, final_end_ok = _edge_coverage(
-        result,
+        stored,
         coverage_start,
         effective_end,
         known_inception_date,

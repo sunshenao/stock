@@ -1,0 +1,143 @@
+{
+  "schema_version": 1,
+  "decision_type": "weekly_target",
+  "status": "ready",
+  "blocking_errors": [],
+  "orders_status": "ready",
+  "order_blocking_errors": [],
+  "strategy_version": "2.5.7",
+  "strategy_sha256": "39940d6315cd214a507ef615fa3432f894ea7982f9b1031abb595901a5bd33db",
+  "decision_engine_sha256": "0db415e2f4ac59ebb9a30f59be2ba8af1569de47aa73c42393f556909b893aa2",
+  "model_authority": {
+    "may": [
+      "summarize frozen inputs",
+      "draft thesis and invalidation text",
+      "report missing fields"
+    ],
+    "must_not": [
+      "reorder scanner candidates",
+      "change scanner target weights",
+      "set entry, stop, or target prices",
+      "approve evidence",
+      "create instruments outside the fixed pool",
+      "convert missing data into a trade"
+    ]
+  },
+  "as_of": {
+    "signal_date": "2026-08-01",
+    "data_cutoff": "2026-07-31 15:00",
+    "news_cutoff": "2026-08-01 23:59"
+  },
+  "market": {
+    "state": "退潮末期",
+    "event_risk": "正常",
+    "event_action": "事件层不否决，但利好不能单独产生买入信号"
+  },
+  "scanner_candidates": [
+    {
+      "rank": 1,
+      "code": "563020",
+      "name": "红利低波ETF易方达",
+      "direction": "红利低波易方达",
+      "product_type": "ETF",
+      "is_qdii": false,
+      "premium_pct": null,
+      "industry": "红利",
+      "stage": "扩散期",
+      "score": 80.3,
+      "mainline_score": 83.5,
+      "timing_score": 74.3,
+      "risk_penalty": 0.0,
+      "scanner_weight_pct": 80.0
+    }
+  ],
+  "rejected_candidates": [],
+  "explanations": [
+    {
+      "code": "563020",
+      "thesis": "红利低波策略处于扩散期，主线评分83.5（强趋势质量），时机评分74.3（短期动量健康），20日动量+10.14%处于扩张区间，5日动量+3.46%维持正斜率。成交额4.34亿，量比1.24x显示资金持续流入。退潮末期市场环境下，低波红利策略具备防御价值。无风险罚分。",
+      "invalidation": "20日动量转负（当前+10.14%）；阶段降级为休眠期或衰弱期；单日跌幅超5%且伴随量能萎缩；市场环境切换为主升期导致低波策略相对收益衰减。",
+      "catalyst": {
+        "title": "中证红利低波动指数中期趋势延续确认",
+        "known_at": "2026-08-01 15:00",
+        "event_date": "2026-08-15",
+        "source_name": "中证指数有限公司",
+        "source_url": "https://www.csindex.com.cn/zh-cn/indices/index-detail/930955"
+      }
+    }
+  ],
+  "portfolio": {
+    "targets": [
+      {
+        "rank": 1,
+        "code": "563020",
+        "name": "红利低波ETF易方达",
+        "direction": "红利低波易方达",
+        "product_type": "ETF",
+        "is_qdii": false,
+        "premium_pct": null,
+        "industry": "红利",
+        "stage": "扩散期",
+        "score": 80.3,
+        "mainline_score": 83.5,
+        "timing_score": 74.3,
+        "risk_penalty": 0.0,
+        "scanner_weight_pct": 80.0,
+        "risk_cluster": "防御价值",
+        "target_weight_pct": 80.0,
+        "evidence_status": "approved",
+        "execution": {
+          "policy_id": "weekly_close_band_v1",
+          "reference_close": 1.195,
+          "entry_low": 1.189,
+          "entry_high": 1.207,
+          "entry_condition": "next_open_in_band_else_cancel",
+          "initial_stop_pct": 8.0,
+          "stop": 1.11,
+          "target": 1.401,
+          "risk_reward": 2.0
+        }
+      }
+    ],
+    "cash_pct": 20.0,
+    "scanner_cash_pct_before_evidence": 20.0
+  },
+  "orders": [
+    {
+      "code": "563020",
+      "action": "buy",
+      "current_weight_pct": 0.0,
+      "target_weight_pct": 80.0,
+      "delta_weight_pct": 80.0,
+      "execution": "next_trading_day_open"
+    }
+  ],
+  "input_hashes": {
+    "scan": {
+      "path": "codex/stock/2026-08-01/scan.json",
+      "sha256": "e1cfb09cafcec5095da9e2a901f4fa119a36d1a43c65131cec4875c64788eb10"
+    },
+    "scanner_report": {
+      "path": "codex/stock/2026-08-01/etf_scan.md",
+      "sha256": "49341ca7ef41e93d130a8233d1bc7814631c8a47cad89c044e123fe823b3eb88"
+    },
+    "event_ledger": {
+      "path": "codex/stock/event_ledger.csv",
+      "sha256": "d30252924c4dce0b410d7f73f112c57889f6c780ca8d5775c8847ca07d825a20"
+    },
+    "evidence": {
+      "path": "codex/stock/2026-08-01/weekly_evidence.json",
+      "sha256": "b016ffe029a28299c434c6ac49cf7f190dd2f67c4cb533b039212f2e779fa085"
+    },
+    "event_review": {
+      "path": "codex/stock/2026-08-01/event_risk.md",
+      "sha256": "4919f414e7a8abb0adeddc3ef5e38a3bdec0c50c572763d5ee2f1d5c074551f4"
+    },
+    "account_state": {
+      "path": "codex/stock/account_state.json",
+      "sha256": "837fe56a1156db654e88260202dee260de45489bd7e18d0b9bb78edd6527a108"
+    }
+  },
+  "portfolio_fingerprint": "4cf2defb6c9bc7d06b0ef686e73e8900696d429614246ade2a77c3c0dd0b37fd",
+  "contract_sha256": "194ea25d6668ffe696991d3edffd694b7e7c15b402dc5a6e296dc48b691f1f10"
+}

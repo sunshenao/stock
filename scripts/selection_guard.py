@@ -1,8 +1,8 @@
 """
 Selection execution guard.
 
-Checks hard portfolio constraints in a generated selection.md before it can be
-treated as an executable plan.
+Checks hard portfolio constraints and the deterministic decision contract before
+a generated weekly selection can be treated as an executable plan.
 """
 from __future__ import annotations
 
@@ -18,9 +18,8 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from risk_rules import (  # noqa: E402
-    TARGET_SELECTION_COUNT,
     get_position_cap,
-    requires_aggressive_deployment,
+    max_selection_count,
     risk_cluster,
     single_position_cap,
 )
@@ -421,16 +420,17 @@ def _validate_holdings(
     if len(active_codes) != len(active_holdings):
         errors.append("正式组合每个标的都必须写出 scripts/etf.txt 中的六位代码")
     if len(set(active_codes)) != len(active_codes):
-        errors.append("正式组合的三个标的代码必须互不相同")
+        errors.append("正式组合的标的代码必须互不相同")
     for holding in active_holdings:
         if holding.code and holding.code not in allowed_codes:
             errors.append(
                 f"{holding.instrument} 不在 scripts/etf.txt 固定池中，禁止进入正式预测"
             )
     if market_state:
-        if len(active_holdings) != TARGET_SELECTION_COUNT:
+        allowed_count = max_selection_count(market_state)
+        if len(active_holdings) > allowed_count:
             errors.append(
-                f"{market_state}正式组合必须有 {TARGET_SELECTION_COUNT} 个非现金标的，"
+                f"{market_state}正式组合最多有 {allowed_count} 个非现金标的，"
                 f"当前为 {len(active_holdings)} 个"
             )
 
@@ -443,10 +443,10 @@ def _validate_holdings(
                 f"{exposure_low:g}-{exposure_high:g}%"
             )
 
-        if len(active_holdings) == TARGET_SELECTION_COUNT:
+        if len(active_holdings) > 1:
             weights = {round(holding.position_high, 2) for holding in active_holdings}
-            if len(weights) != TARGET_SELECTION_COUNT:
-                errors.append("三只标的必须按强弱设置不同仓位，不能机械等权")
+            if len(weights) != len(active_holdings):
+                errors.append("多个标的应按强弱设置不同仓位，不能机械等权")
 
     direction_exposure: dict[str, float] = {}
     for holding in active_holdings:
@@ -530,9 +530,10 @@ def _validate_holdings(
                     f"退潮期 {holding.instrument} 20日动量 {ret20:+g}%>{RETREAT_RET20_NEW_POSITION_LIMIT:g}% 且无新催化，不允许新开仓"
                 )
 
+    direction_cap = max(60, get_position_cap(market_state or "未知").high)
     for direction, exposure in direction_exposure.items():
-        if exposure > 60:
-            errors.append(f"单一方向 {direction} 合计仓位 {exposure:g}% 超过 60%")
+        if exposure > direction_cap:
+            errors.append(f"单一方向 {direction} 合计仓位 {exposure:g}% 超过 {direction_cap}%")
 
 
 def _parse_evidence_time(value: str) -> datetime | None:
@@ -636,9 +637,39 @@ def _validate_structured_evidence(
             errors.append(f"{holding.instrument} catalyst source_url 必须是可追溯链接")
 
 
-def validate_selection(path: Path) -> tuple[bool, list[str]]:
+def _validate_decision_link(path: Path, text: str, errors: list[str]) -> None:
+    if path.name != "selection.generated.md":
+        errors.append("正式方案文件必须是 decision_contract.py 生成的 selection.generated.md")
+        return
+    decision_path = path.with_name("decision.json")
+    if not decision_path.exists():
+        errors.append("缺少同目录 decision.json，手写方案没有执行权限")
+        return
+    try:
+        from decision_contract import _render_selection, verify_decision
+
+        decision = json.loads(decision_path.read_text(encoding="utf-8-sig"))
+        ok, contract_errors = verify_decision(decision_path)
+        if not ok:
+            errors.extend(f"决策契约: {error}" for error in contract_errors)
+            return
+        expected = _render_selection(decision)
+    except (OSError, ValueError, json.JSONDecodeError, KeyError) as exc:
+        errors.append(f"决策契约无法复算: {exc}")
+        return
+    if text.strip() != expected.strip():
+        errors.append("selection.generated.md 与 decision.json 的确定性渲染结果不一致")
+
+
+def validate_selection(
+    path: Path,
+    *,
+    require_decision_contract: bool = True,
+) -> tuple[bool, list[str]]:
     text = path.read_text(encoding="utf-8-sig")
     errors = []
+    if require_decision_contract:
+        _validate_decision_link(path, text, errors)
     allowed_codes = {cfg["code"] for cfg in load_etf_txt().values()}
     if not allowed_codes:
         errors.append("scripts/etf.txt 为空或读取失败，禁止生成正式预测")
@@ -689,11 +720,6 @@ def validate_selection(path: Path) -> tuple[bool, list[str]]:
 
     if market_state and cash_range:
         cash_low, cash_high = cash_range
-        if requires_aggressive_deployment(market_state) and cash_high > 40:
-            errors.append(
-                f"{market_state}要求现金≤40%，当前现金区间为{cash_low:g}-{cash_high:g}%"
-            )
-
         holdings = _extract_portfolio_holdings(text)
         active = [holding for holding in holdings if not holding.is_cash]
         invested_low = sum(holding.position_low for holding in active)

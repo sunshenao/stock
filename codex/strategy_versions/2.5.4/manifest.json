@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "strategy_version": "2.5.4",
+  "frozen_at": "2026-07-27T22:45:00+08:00",
+  "forward_start": "2026-07-27",
+  "minimum_forward_weeks": 26,
+  "parameter_change_policy": "Freeze signal, position, execution and universe rules during the forward window. Emergency bug fixes require a new version.",
+  "combined_sha256": "ee85dbaed8ed353fa2322136d29f8015127ec1ee3fe3404c6f148ede86225b6d",
+  "files": {
+    "scripts/risk_rules.py": "38a823f790951bb2f38e0f8f32553a182feda212a435d4cbc51ffa14ed377488",
+    "scripts/market_state.py": "2d0cb88a1a2f4e841d7286fc6615ac907842cc8295c37ecb2c89c913748a03f7",
+    "scripts/daily_risk.py": "050260b07b5ec3fb9fc50e7768f1e7396977f71bf8aa2b8d5ff73ee0307bd209",
+    "scripts/execution_model.py": "d57b74a007a36ea43e57c16d97e8813f9d72dc9bf4ecf97b0e80d1883a3c58d3",
+    "scripts/event_risk.py": "f849b66d1f70c5e430e387d04bb6e61223b26534f9785e5ea6bb9a418dc157f3",
+    "scripts/market_data_cache.py": "0aab977f4f0a3c57566fef7a21fc3f38064b7ea6c01352dfa1fa08a4ba9a8b25",
+    "scripts/etf_analyzer.py": "cd9a88293ce10ef1096ab249fcf7f4d7200ea510396f2e295ad66f8b1969c20b",
+    "scripts/backtest.py": "4e024a28f70fdd53c833d2d7946e837811145b234ac48c5dc883bd5ab2a2d9fb",
+    "scripts/backtest_current.py": "9b9e799a4cd3326c8ae4e4cfd76db254319a06755f9a7989068d92c4df411cba",
+    "scripts/workflow.py": "6a5dd506247ebf7e11ad086c94a5cf51da0587e889e8eebdfbf3089cf695929e",
+    "scripts/selection_guard.py": "7047c9be79df7dbb36ecafc791eaac7e4bf85e8d3cfd7c25da710796ba2ee120",
+    "scripts/decision_contract.py": "0db415e2f4ac59ebb9a30f59be2ba8af1569de47aa73c42393f556909b893aa2",
+    "scripts/ops_contract.py": "610785e467ea3e8ab4ea2fe19d63fb8f58d99c1bedbf76ca43b310bd682bb4ae",
+    "scripts/universe_history.py": "3209b0963b4c8e6356d1b3bf5350128bf59613368257aa8d898f83218c704c98",
+    "scripts/etf.txt": "acdf5f2357ce70b7575cc7113380d24aa04a6d9ef92c819812b24313e27c5596",
+    "scripts/etf_universe_history.csv": "906f5055c619df9edf0d286dc1c77aca01c42d35b1b8b82c28d1f1184689350d",
+    "codex/stock_selection_logic.md": "f614102e57020a340b71fd1903c9e69fceac3899871087a85bcfac49b34ef0e8",
+    "codex/contracts/weekly_evidence.template.json": "77b6300070ee75298722b88724916ce2b73805277a392e465dfc424620da2c1b",
+    "codex/contracts/account_state.template.json": "7629f47ef9236ab41556b5db040e59b0f5a91e8993f7a520bd6004856e90eeab",
+    "codex/contracts/ops_packet.template.json": "3d97c8d78827946590c6273b545ce1e9fa983365179020e7f6bfe108e9f37f27",
+    "codex/contracts/weekly_review_packet.template.json": "b70527610b96acce7080fa7aff8b608478ef0846466e93ea67c12db1a2702c04"
+  }
+}

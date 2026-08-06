@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "phase": "weekly_review",
+  "date": "YYYY-MM-DD",
+  "as_of": "YYYY-MM-DD 16:30",
+  "strategy_version": "2.5.5",
+  "data_quality": "pass",
+  "completed_checks": [],
+  "facts": {
+    "hard_risk_triggered": false,
+    "notes": []
+  },
+  "decision": {
+    "action": "review_only",
+    "codes": [],
+    "reason_codes": [],
+    "decision_contract": "",
+    "authorization": {
+      "kind": "",
+      "id": "",
+      "authorized_at": "",
+      "action": "",
+      "codes": [],
+      "reason_codes": []
+    }
+  },
+  "parameter_changes": [],
+  "metrics": {
+    "strategy_return_pct": 0.0,
+    "benchmark_return_pct": 0.0,
+    "excess_return_pct": 0.0,
+    "max_drawdown_pct": 0.0,
+    "average_exposure_pct": 0.0,
+    "turnover_multiple": 0.0,
+    "cost_pct": 0.0
+  },
+  "attribution": {
+    "market_exposure_pct": 0.0,
+    "selection_pct": 0.0,
+    "timing_pct": 0.0,
+    "cost_pct": 0.0,
+    "risk_actions_pct": 0.0,
+    "residual_pct": 0.0
+  },
+  "issues": [],
+  "lessons": [],
+  "reflection": {
+    "did_right": [],
+    "did_wrong": [],
+    "luck": []
+  },
+  "next_week_actions": []
+}

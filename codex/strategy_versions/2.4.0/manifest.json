@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "strategy_version": "2.4.0",
+  "frozen_at": "2026-07-26T03:28:47+08:00",
+  "forward_start": "2026-07-27",
+  "minimum_forward_weeks": 26,
+  "parameter_change_policy": "Freeze signal, position, execution and universe rules during the forward window. Emergency bug fixes require a new version.",
+  "combined_sha256": "cd94059a50286512ad6bea99e5a3821b0e71f767d48325fce9be071c85d2857b",
+  "files": {
+    "scripts/risk_rules.py": "10d971a5b802e886dc3fb75d25e2c88c523df1487060f626ccba04b13ad2dfc3",
+    "scripts/market_state.py": "2d0cb88a1a2f4e841d7286fc6615ac907842cc8295c37ecb2c89c913748a03f7",
+    "scripts/daily_risk.py": "050260b07b5ec3fb9fc50e7768f1e7396977f71bf8aa2b8d5ff73ee0307bd209",
+    "scripts/execution_model.py": "d57b74a007a36ea43e57c16d97e8813f9d72dc9bf4ecf97b0e80d1883a3c58d3",
+    "scripts/event_risk.py": "f849b66d1f70c5e430e387d04bb6e61223b26534f9785e5ea6bb9a418dc157f3",
+    "scripts/market_data_cache.py": "0aab977f4f0a3c57566fef7a21fc3f38064b7ea6c01352dfa1fa08a4ba9a8b25",
+    "scripts/etf_analyzer.py": "98cf16dd35414cc8ff02e0076136b0ded21ccad8c5eb7fb48e3c47b2eed44f0e",
+    "scripts/backtest.py": "1e410d1b87651ab6159c940dbe682c376be457d7b10d06b5ff5ee50a0b5a7ab8",
+    "scripts/backtest_current.py": "5212150d677bbae4c4bed3b4d15037749d1c80986354f97ade497848e6f3858f",
+    "scripts/workflow.py": "9274a2184988ea612df6fb0e74fd842f0c8f4af1be0d6abeaf39caa517b4f7ea",
+    "scripts/selection_guard.py": "f8c93fd9448681a9baf66b7042106ea5d7ba53467bee199463821ddb0967adfc",
+    "scripts/universe_history.py": "3209b0963b4c8e6356d1b3bf5350128bf59613368257aa8d898f83218c704c98",
+    "scripts/etf.txt": "acdf5f2357ce70b7575cc7113380d24aa04a6d9ef92c819812b24313e27c5596",
+    "scripts/etf_universe_history.csv": "906f5055c619df9edf0d286dc1c77aca01c42d35b1b8b82c28d1f1184689350d",
+    "codex/stock_selection_logic.md": "ad3e608223ec267ffd21d5253dc4ed8c4023545914936162e05305581bb9091a"
+  }
+}

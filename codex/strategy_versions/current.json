@@ -1,5 +1,5 @@
 {
-  "strategy_version": "2.1.0",
-  "manifest": "codex/strategy_versions/2.1.0/manifest.json",
-  "combined_sha256": "6cc9c311828d06d35e8f16b9a3b97e5a03f0f4afe44cac35257da2c590c21e8b"
+  "strategy_version": "2.5.7",
+  "manifest": "codex/strategy_versions/2.5.7/manifest.json",
+  "combined_sha256": "39940d6315cd214a507ef615fa3432f894ea7982f9b1031abb595901a5bd33db"
 }

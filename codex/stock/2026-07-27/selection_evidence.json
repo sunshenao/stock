@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "data_cutoff": "2026-07-24 15:00",
+  "news_cutoff": "2026-07-26 23:59",
+  "holdings": [
+    {
+      "code": "159985",
+      "action": "new",
+      "thesis": "豆粕处于扩散期，三条均线全部向上，主线分89.1/买点分79.1/风险罚分0.0远超门禁。商品类与A股权益低相关，退潮末期提供防御+进攻双重属性。USDA作物进度报告用于验证大豆供给收紧与天气升水逻辑是否延续。",
+      "invalidation": "USDA数据否定供给收紧预期且ETF跌破MA20（约2.230）；或单日跌幅超4%且量能萎缩至1.0x以下；或20日动量转负或评分跌破60。",
+      "catalyst": {
+        "title": "USDA Crop Progress",
+        "known_at": "2026-07-25 20:00",
+        "event_date": "2026-07-27T16:00:00-04:00",
+        "source_name": "USDA NASS",
+        "source_url": "https://esmis.nal.usda.gov/publication/crop-progress"
+      }
+    }
+  ]
+}

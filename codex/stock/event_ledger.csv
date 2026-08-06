@@ -4,3 +4,8 @@ known_at,event_type,scope,score,horizon_days,source,url,summary
 2026-07-24T20:04:57,commodity,资源商品,0.30,5,第一财经,https://www.yicai.com/news/103291576.html,国际油价上行强化能源链价格弹性同时抬升通胀风险
 2026-07-25T18:00:00,scheduled_data,资源商品,0.15,3,USDA NASS,https://esmis.nal.usda.gov/publication/crop-progress,美国农业部将于7月27日发布作物生长进度报告用于验证大豆天气交易
 2026-07-25T18:00:00,scheduled_data,资源商品,0.10,3,US EIA,https://www.eia.gov/petroleum/supply/weekly/,美国能源信息署将于7月29日发布周度石油库存报告用于验证油价供需
+2026-07-20T23:59:00,official_data,资源商品,-0.45,10,USDA ERS,https://www.ers.usda.gov/topics/crops/soybeans-and-oil-crops/market-outlook,美国农业部预计2026至2027市场年度大豆和油菜籽产量创纪录削弱单边供给收紧假设
+2026-07-24T23:59:00,market_disruption,159985,-0.90,7,华夏基金公告（新浪财经转引）,https://finance.sina.com.cn/7x24/2026-07-24/doc-iniiwzsm1563072.shtml,豆粕ETF华夏收盘价2.290元较参考净值2.1577元溢价约6.13%且管理人提示7月27日可能采取临时停牌措施
+2026-07-26T10:58:11,macro,global,-0.50,3,第一财经,https://www.yicai.com/news/103292274.html,油价飙升和美债收益率上行叠加美股科技波动令本周全球风险资产承压
+2026-07-27T15:00:00,product_status,159985,0.20,2,华夏基金,https://www.chinaamc.com/product/getPortfolioCompositionFile.do?fundcode=159985,7月27日申购赎回清单显示豆粕ETF华夏允许申购和赎回且需要公布IOPV用于验证临停风险是否缓解
+2026-07-27T16:12:14,market_breadth,A股市场,0.55,3,每日经济新闻,https://www.nbd.com.cn/articles/2026-07-27/4517257.html,A股主要指数集体上涨全市场成交额约2.09万亿元且近5200只个股上涨显示单日宽度强修复

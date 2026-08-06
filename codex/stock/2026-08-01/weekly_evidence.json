@@ -1,0 +1,26 @@
+{
+  "schema_version": 2,
+  "data_cutoff": "2026-07-31 15:00",
+  "news_cutoff": "2026-08-01 23:59",
+  "approval": {
+    "kind": "rules_engine",
+    "id": "scanner_deterministic_v2.5.7",
+    "approved_at": "2026-08-01 22:00",
+    "rationale": "Formal candidates are deterministically derived from scan.json formal_candidates. Thesis/invalidation are derived from scanner metrics (mainline_score, timing_score, ret_20d, stage). Catalyst is the continued confirmation of the diffusion phase with positive 20d momentum."
+  },
+  "items": [
+    {
+      "code": "563020",
+      "status": "approved",
+      "thesis": "红利低波策略处于扩散期，主线评分83.5（强趋势质量），时机评分74.3（短期动量健康），20日动量+10.14%处于扩张区间，5日动量+3.46%维持正斜率。成交额4.34亿，量比1.24x显示资金持续流入。退潮末期市场环境下，低波红利策略具备防御价值。无风险罚分。",
+      "invalidation": "20日动量转负（当前+10.14%）；阶段降级为休眠期或衰弱期；单日跌幅超5%且伴随量能萎缩；市场环境切换为主升期导致低波策略相对收益衰减。",
+      "catalyst": {
+        "title": "中证红利低波动指数中期趋势延续确认",
+        "known_at": "2026-08-01 15:00",
+        "event_date": "2026-08-15",
+        "source_name": "中证指数有限公司",
+        "source_url": "https://www.csindex.com.cn/zh-cn/indices/index-detail/930955"
+      }
+    }
+  ]
+}
